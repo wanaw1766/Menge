@@ -49,17 +49,6 @@ _PRIORITY_KEYWORDS = [
     "unemployment rate", "retail sales", "gold", "xau",
 ]
 
-# ── VIP events — ONLY these get 15-min reminders ─────────────────────────────
-_VIP_KEYWORDS = [
-    "fomc", "federal open market committee",
-    "federal funds rate", "interest rate decision",
-    "nfp", "non-farm payroll", "non-farm payrolls",
-    "cpi", "consumer price index",
-    "pce", "core pce",
-    "gdp", "advance gdp", "preliminary gdp",
-    "fed chair", "powell speaks", "jerome powell",
-]
-
 _UNIQUE_EVENT_NAMES = [
     "federal funds rate", "interest rate decision",
     "non-farm payroll", "nfp", "consumer price index", "cpi",
@@ -79,21 +68,14 @@ _EVENT_PATTERN = re.compile(
 )
 
 
-def _is_vip_event(name: str) -> bool:
-    """True only for top-tier events that get a 15-min reminder."""
-    n = name.lower()
-    return any(kw in n for kw in _VIP_KEYWORDS)
-
-
 def _is_reminder_eligible(event: dict) -> bool:
-    """Only VIP red 🔴 events get reminders — not all red events."""
+    """ALL red 🔴 events are eligible except geopolitical."""
     if event.get("impact") != "red":
         return False
     name_lower = event.get("name", "").lower()
     if any(kw in name_lower for kw in GEOPOLITICAL_KEYWORDS):
         return False
-    # Must match VIP keywords — ISM, Retail Sales, etc. do NOT get reminders
-    return _is_vip_event(name_lower)
+    return True
 
 
 def _is_priority_event(name: str) -> bool:
@@ -558,12 +540,12 @@ class ChannelScraper:
             return False
 
     def _select_vip_events(self, events: List[dict]) -> List[dict]:
-        """Only VIP red events get reminders (FOMC, NFP, CPI, GDP, PCE, Powell)."""
+        """ALL red 🔴 events get reminders (except geopolitical), sorted by time."""
         eligible = [e for e in events if _is_reminder_eligible(e)]
         if not eligible:
             return []
         vip = sorted(eligible, key=lambda e: e.get("time_24h", "99:99"))
-        log.info(f"VIP events (reminder eligible): {[e.get('name') for e in vip]}")
+        log.info(f"VIP events for reminders: {[e.get('name') for e in vip]}")
         return vip
 
     async def _check_reminders(self):
@@ -617,9 +599,10 @@ class ChannelScraper:
 
             log.info(f"⏰ {event.get('name')} at {event.get('time_12h')} — {minutes_until:.0f} min away")
 
-            if 14 <= minutes_until <= 16:
+            if 9 <= minutes_until <= 11:
                 await self._send_reminder(
-                    event, event_key, briefing_msg_id, today_str, 15
+                    event, event_key, briefing_msg_id, today_str,
+                    int(round(minutes_until))
                 )
                 await asyncio.sleep(2)
 
@@ -757,43 +740,25 @@ class ChannelScraper:
             ]
 
             if not events:
-                log.info("No USD events today — posting quiet day message.")
-                date_line = _eat_date_line()
-                quiet_text = (
-                    f"TODAY'S USD 🇺🇸 NEWS\n\n"
-                    f"{date_line}\n\n"
-                    f"🟢 No major USD news events scheduled for today.\n"
-                    f"Markets are expected to be relatively calm — trade safely."
-                )
-                quiet_text = _add_signature(quiet_text)
-                sent = await self._broadcast_file_with_caption(
-                    image_data, image_mime, quiet_text
-                )
-                if sent:
-                    await self._mem.save_daily_briefing(today_str, sent.id, [])
-                else:
-                    await self._mem.delete_daily_briefing(today_str)
+                await self._mem.delete_daily_briefing(today_str)
+                log.info("All events geopolitical — skipping.")
                 return
 
             self._todays_vip_events = self._select_vip_events(events)
             log.info(f"VIP reminders: {[e.get('name') for e in self._todays_vip_events]}")
 
             # ── Build final post ───────────────────────────────────────────
-            has_red   = any(e["impact"] == "red" for e in events)
-            date_line = _eat_date_line()   # "Friday, May 1"
-
-            # Title — HIGH IMPACT only when at least one red event exists
-            title = "TODAY'S USD 🇺🇸 HIGH IMPACT NEWS" if has_red else "TODAY'S USD 🇺🇸 NEWS"
+            title     = "TODAY'S USD 🇺🇸 HIGH IMPACT NEWS"   # no 📅 emoji
+            date_line = _eat_date_line()                       # "Friday, May 1"
 
             lines = [title, "", date_line, ""]
             for e in events:
                 emoji = "🔴" if e["impact"] == "red" else "🟠"
                 lines.append(f"{emoji} {e['time_12h']} | {e['currency']}: {e['name']}")
 
-            # "Be careful" only on high impact days
-            if has_red:
-                lines.append("")
-                lines.append("Be careful during these releases.")
+            # Be careful line at the bottom
+            lines.append("")
+            lines.append("Be careful during these releases.")
 
             post_text = "\n".join(lines)
             post_text = _add_signature(post_text)   # signature added ONCE
