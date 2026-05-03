@@ -142,9 +142,6 @@ REJECT IF ANY OF THESE APPLY:
 10. PREDICTION   — "I think", "expect", "my analysis"
 11. COMMENTARY   — Personal views, market opinions
 12. FORECAST/PREVIOUS — Any mention of "forecast", "expected", "previous" values
-13. SENTIMENT    — Fear & Greed index, bank sentiment, market mood indicators,
-                   "banks are bullish/bearish", "smart money", "COT report opinions",
-                   sentiment surveys, positioning reports with opinions
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT (if approved):
@@ -186,32 +183,22 @@ Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
-TODAY'S DATE: {today_date}
+TODAY'S DATE: {today_date}  (verify the calendar shows this exact date)
 
 INSTRUCTIONS:
-1. DATE CHECK — Look at the date shown anywhere in the screenshot (header, "Today" label, column header, etc).
-   The screenshot must show the SAME month and day as {today_date}.
-   IMPORTANT: Ignore formatting differences — "May 1", "May 01", "Fri May 1", "05/01" all count as the same date.
-   Only reject if the month OR day is clearly different (e.g. screenshot shows April 30 but today is May 1).
-   Do NOT reject just because the year is missing or the format looks different.
-
-2. Extract ALL USD high-impact (🔴) and medium-impact (🟠) events visible.
-   Write EACH event on its OWN separate line — even if they share the same time.
-
-3. Do NOT include the year in the date line (e.g. "Friday, May 1" — no year).
-
+1. Check the date in the screenshot — must match {today_date}. If not → reject.
+2. Extract ALL USD high-impact (🔴) and medium-impact (🟠) events.
+   Write EACH event on its OWN separate line — even if same time.
+3. Do NOT include the year in the date line (e.g. "Thursday, April 30").
 4. Do NOT add any hashtags.
-
 5. No forecast, no previous data, no NOTE, no commentary.
-
-6. Do NOT add "Be careful" line — added automatically by the system.
-
-7. Keep original times. Use 12-hour AM/PM format. No timezone label. No leading zero on hour.
+6. Do NOT add "Be careful" line — it is added automatically.
+7. Keep original times. Convert to 12-hour AM/PM. No timezone. No leading zero.
 
 EXACT OUTPUT FORMAT:
 
 TODAY'S USD HIGH IMPACT NEWS
-Friday, May 1
+Thursday, April 30
 
 🔴 3:30 PM | USD: Advance GDP q/q
 🔴 3:30 PM | USD: Core PCE Price Index m/m
@@ -225,7 +212,7 @@ RULES:
 - Plain text only — no asterisks, no bold
 - Do NOT add signature or "Be careful" line
 
-If screenshot clearly shows a DIFFERENT month or day → {{"approved": false, "reason": "wrong date"}}
+If not valid FF calendar for today → {{"approved": false, "reason": "not valid FF today image"}}
 If valid → {{"approved": true, "reason": "valid FF today image", "formatted_text": "..."}}
 RESPOND WITH VALID JSON ONLY.
 """.strip()
@@ -295,7 +282,7 @@ def _validate_and_clean(data: dict) -> dict:
         # Strip any AI-generated "Be careful" line — scraper adds its own
         data["formatted_text"] = _strip_be_careful(data["formatted_text"])
         text = data["formatted_text"]
-        if "TODAY'S USD" in text or "WEEKLY HIGH IMPACT" in text:
+        if "TODAY'S USD HIGH IMPACT" in text or "WEEKLY HIGH IMPACT" in text:
             text = re.sub(r"#\w+", "", text).strip()
             data["formatted_text"] = text
         else:
@@ -369,7 +356,7 @@ class AIEngine:
             log.info(f"Gemini → approved={verdict['approved']} | {verdict.get('reason', '')}")
             if verdict.get("approved") and verdict.get("formatted_text"):
                 verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
-                if not verdict["formatted_text"].startswith("TODAY'S USD"):
+                if not verdict["formatted_text"].startswith("TODAY'S USD HIGH IMPACT"):
                     verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
             return verdict
         except Exception as exc:
@@ -382,7 +369,7 @@ class AIEngine:
             log.info(f"Groq → approved={verdict['approved']} | {verdict.get('reason', '')}")
             if verdict.get("approved") and verdict.get("formatted_text"):
                 verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
-                if not verdict["formatted_text"].startswith("TODAY'S USD"):
+                if not verdict["formatted_text"].startswith("TODAY'S USD HIGH IMPACT"):
                     verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
             return verdict
         except Exception as exc:
