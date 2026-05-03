@@ -49,6 +49,17 @@ _PRIORITY_KEYWORDS = [
     "unemployment rate", "retail sales", "gold", "xau",
 ]
 
+# ── VIP events — ONLY these get 15-min reminders ─────────────────────────────
+_VIP_KEYWORDS = [
+    "fomc", "federal open market committee",
+    "federal funds rate", "interest rate decision",
+    "nfp", "non-farm payroll", "non-farm payrolls",
+    "cpi", "consumer price index",
+    "pce", "core pce",
+    "gdp", "advance gdp", "preliminary gdp",
+    "fed chair", "powell speaks", "jerome powell",
+]
+
 _UNIQUE_EVENT_NAMES = [
     "federal funds rate", "interest rate decision",
     "non-farm payroll", "nfp", "consumer price index", "cpi",
@@ -68,14 +79,21 @@ _EVENT_PATTERN = re.compile(
 )
 
 
+def _is_vip_event(name: str) -> bool:
+    """True only for top-tier events that get a 15-min reminder."""
+    n = name.lower()
+    return any(kw in n for kw in _VIP_KEYWORDS)
+
+
 def _is_reminder_eligible(event: dict) -> bool:
-    """ALL red 🔴 events are eligible except geopolitical."""
+    """Only VIP red 🔴 events get reminders — not all red events."""
     if event.get("impact") != "red":
         return False
     name_lower = event.get("name", "").lower()
     if any(kw in name_lower for kw in GEOPOLITICAL_KEYWORDS):
         return False
-    return True
+    # Must match VIP keywords — ISM, Retail Sales, etc. do NOT get reminders
+    return _is_vip_event(name_lower)
 
 
 def _is_priority_event(name: str) -> bool:
@@ -125,9 +143,18 @@ def _looks_like_ff_image(text: str) -> bool:
 
 
 def _looks_like_weekly(text: str) -> bool:
+    # Check caption text for any day/week related keywords
     if not text:
         return False
-    return any(kw in text.lower() for kw in ("week", "weekly", "this week", "next week"))
+    t = text.lower()
+    weekly_kw = (
+        "week", "weekly", "this week", "next week",
+        "mon", "tue", "wed", "thu", "fri",
+        "monday", "tuesday", "wednesday", "thursday", "friday",
+        "jan", "feb", "mar", "apr", "may", "jun",
+        "jul", "aug", "sep", "oct", "nov", "dec",
+    )
+    return any(kw in t for kw in weekly_kw)
 
 
 def _normalise_urls(text: str) -> str:
@@ -424,15 +451,31 @@ class ChannelScraper:
             except Exception as exc:
                 log.warning(f"Image download failed: {exc}")
 
-        if image_data and (
-            _looks_like_ff_image(text) or
-            await self._image_looks_like_ff(image_data, image_mime)
-        ):
-            is_weekly = _looks_like_weekly(text)
-            await self._handle_ff_image(
-                image_data, image_mime, text, is_weekly, source_channel, msg.id
-            )
-            return
+        if image_data:
+            # Check caption keywords first (free, no API call)
+            caption_is_ff     = _looks_like_ff_image(text)
+            caption_is_weekly = _looks_like_weekly(text)
+
+            if caption_is_ff:
+                # Caption confirms FF — only call AI if weekly not clear from caption
+                is_weekly = caption_is_weekly
+                if not is_weekly:
+                    # Ask AI to confirm weekly/daily
+                    _, ai_weekly = await self._image_looks_like_ff(image_data, image_mime)
+                    is_weekly = ai_weekly
+                await self._handle_ff_image(
+                    image_data, image_mime, text, is_weekly, source_channel, msg.id
+                )
+                return
+            else:
+                # Caption doesn't confirm FF — ask AI
+                ai_is_ff, ai_is_weekly = await self._image_looks_like_ff(image_data, image_mime)
+                if ai_is_ff:
+                    is_weekly = caption_is_weekly or ai_is_weekly
+                    await self._handle_ff_image(
+                        image_data, image_mime, text, is_weekly, source_channel, msg.id
+                    )
+                    return
 
         content_hash = self._mem.hash_combined(text, image_data)
 
@@ -513,39 +556,51 @@ class ChannelScraper:
             log.warning(f"Similarity check error: {exc}")
         return False
 
-    async def _image_looks_like_ff(self, image_data: bytes, image_mime: str) -> bool:
+    async def _image_looks_like_ff(self, image_data: bytes, image_mime: str) -> tuple:
+        """
+        Returns (is_ff: bool, is_weekly: bool).
+        Detects FF calendar AND whether it's a weekly or daily — in one AI call.
+        """
         try:
             prompt = (
-                "Is this image a ForexFactory.com economic calendar screenshot? "
-                "Respond with JSON: {\"is_ff\": true} or {\"is_ff\": false}"
+                "Look at this image carefully. Answer two questions:\n"
+                "1. Is this a ForexFactory.com economic calendar screenshot?\n"
+                "2. Does it show MULTIPLE DAYS (weekly view) or just ONE day (daily view)?\n"
+                "   Weekly = shows Mon/Tue/Wed/Thu/Fri or multiple dates.\n"
+                "   Daily = shows only one date/day.\n\n"
+                "Respond ONLY with JSON:\n"
+                "{\"is_ff\": true/false, \"is_weekly\": true/false}"
             )
             parts = [
                 {"inline_data": {"mime_type": image_mime,
                                  "data": __import__('base64').b64encode(image_data).decode()}},
                 prompt
             ]
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             resp = await asyncio.wait_for(
                 loop.run_in_executor(
                     None, lambda: self._ai._gemini_vision.generate_content(parts)
                 ),
-                timeout=30   # FIX: was 15s — too short for gemini-2.5-flash
+                timeout=30
             )
             import json as _json, re as _re
             raw = _re.sub(r"```+(?:json)?", "", resp.text).strip()
             data = _json.loads(raw)
-            return bool(data.get("is_ff", False))
+            is_ff     = bool(data.get("is_ff", False))
+            is_weekly = bool(data.get("is_weekly", False))
+            log.info(f"FF image check → is_ff={is_ff} | is_weekly={is_weekly}")
+            return is_ff, is_weekly
         except Exception as exc:
             log.warning(f"FF image check failed: {exc} — assuming not FF")
-            return False
+            return False, False
 
     def _select_vip_events(self, events: List[dict]) -> List[dict]:
-        """ALL red 🔴 events get reminders (except geopolitical), sorted by time."""
+        """Only VIP red events get reminders (FOMC, NFP, CPI, GDP, PCE, Powell)."""
         eligible = [e for e in events if _is_reminder_eligible(e)]
         if not eligible:
             return []
         vip = sorted(eligible, key=lambda e: e.get("time_24h", "99:99"))
-        log.info(f"VIP events for reminders: {[e.get('name') for e in vip]}")
+        log.info(f"VIP events (reminder eligible): {[e.get('name') for e in vip]}")
         return vip
 
     async def _check_reminders(self):
@@ -599,10 +654,9 @@ class ChannelScraper:
 
             log.info(f"⏰ {event.get('name')} at {event.get('time_12h')} — {minutes_until:.0f} min away")
 
-            if 9 <= minutes_until <= 11:
+            if 14 <= minutes_until <= 16:
                 await self._send_reminder(
-                    event, event_key, briefing_msg_id, today_str,
-                    int(round(minutes_until))
+                    event, event_key, briefing_msg_id, today_str, 15
                 )
                 await asyncio.sleep(2)
 
@@ -676,8 +730,8 @@ class ChannelScraper:
 
         if is_weekly:
             now = _eat_now()
-            week_start = now + timedelta(days=(7 - now.weekday()))
-            week_end = week_start + timedelta(days=4)
+            week_start = now - timedelta(days=now.weekday())   # FIX: always Monday of THIS week
+            week_end = week_start + timedelta(days=4)           # Friday
             week_range = f"{week_start.strftime('%b %-d')} – {week_end.strftime('%b %-d, %Y')}"
             week_key = now.strftime("%Y-%W")
             if await self._mem.has_weekly_posted(week_key):
@@ -740,25 +794,37 @@ class ChannelScraper:
             ]
 
             if not events:
-                await self._mem.delete_daily_briefing(today_str)
-                log.info("All events geopolitical — skipping.")
+                log.info("No USD events today — posting quiet day message.")
+                quiet_text = "🟢 No major news today — markets expected calm. Trade safe."
+                quiet_text = _add_signature(quiet_text)
+                sent = await self._broadcast_file_with_caption(
+                    image_data, image_mime, quiet_text
+                )
+                if sent:
+                    await self._mem.save_daily_briefing(today_str, sent.id, [])
+                else:
+                    await self._mem.delete_daily_briefing(today_str)
                 return
 
             self._todays_vip_events = self._select_vip_events(events)
             log.info(f"VIP reminders: {[e.get('name') for e in self._todays_vip_events]}")
 
             # ── Build final post ───────────────────────────────────────────
-            title     = "TODAY'S USD 🇺🇸 HIGH IMPACT NEWS"   # no 📅 emoji
-            date_line = _eat_date_line()                       # "Friday, May 1"
+            has_red   = any(e["impact"] == "red" for e in events)
+            date_line = _eat_date_line()   # "Friday, May 1"
+
+            # Title — HIGH IMPACT only when at least one red event exists
+            title = "TODAY'S USD 🇺🇸 HIGH IMPACT NEWS" if has_red else "TODAY'S USD 🇺🇸 NEWS"
 
             lines = [title, "", date_line, ""]
             for e in events:
                 emoji = "🔴" if e["impact"] == "red" else "🟠"
                 lines.append(f"{emoji} {e['time_12h']} | {e['currency']}: {e['name']}")
 
-            # Be careful line at the bottom
-            lines.append("")
-            lines.append("Be careful during these releases.")
+            # "Be careful" only on high impact days
+            if has_red:
+                lines.append("")
+                lines.append("Be careful during these releases.")
 
             post_text = "\n".join(lines)
             post_text = _add_signature(post_text)   # signature added ONCE
