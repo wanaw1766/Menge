@@ -1,10 +1,11 @@
 """
-ai_engine.py — AXIOM INTEL Final
+ai_engine.py — AXIOM INTEL Final (Unabridged)
 - Preserves exact numbers/prices.
 - Rejects TA charts with markings.
 - Hashtags only #XAUUSD, #OIL, #DXY.
 - ForexFactory calendar detection (daily/weekly) with date‑range logic.
 - Duplicate detection via AI similarity.
+- Gemini primary, Groq fallback with retries.
 """
 
 import asyncio
@@ -52,7 +53,7 @@ def _add_us_flag_emoji(text: str) -> str:
 
 
 def _strip_be_careful(text: str) -> str:
-    """Remove any AI-generated 'Be careful' line – we add our own controlled version."""
+    """Remove any AI-generated 'Be careful' line – we add our own."""
     return re.sub(r'\n?Be careful[^\n]*\n?', '', text, flags=re.IGNORECASE).strip()
 
 
@@ -161,7 +162,8 @@ FORMAT (if approved):
 EMOJI: 🚨 🌍 📊 🏦 🛢️ 🏆 💵 ⚠️ 🗳️
 
 RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS.
-""".strip()  # No trailing comma in JSON example
+""".strip()
+
 
 _SIMILARITY_PROMPT = """
 You are a duplicate news detector. Compare the two stories. If they describe the same real-world event – even if worded differently, in different languages, or with minor spelling mistakes – respond with same_story=true.
@@ -355,7 +357,7 @@ def _signal_hit(text: str) -> Optional[str]:
 
 
 class AIEngine:
-    """Main AI interface – uses Gemini as primary, Groq as fallback."""
+    """Main AI interface – uses Gemini as primary, Groq as fallback with retries."""
 
     def __init__(self, gemini_key: str, groq_key: str, channel_category: str):
         self._category = channel_category
@@ -370,10 +372,6 @@ class AIEngine:
                 response_mime_type="application/json"
             ),
         )
-        self._gemini_text = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
-            generation_config=genai.GenerationConfig(temperature=0.2, max_output_tokens=1200),
-        )
         self._gemini_vision = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             generation_config=genai.GenerationConfig(
@@ -386,23 +384,29 @@ class AIEngine:
                       image_mime: str = "image/jpeg") -> dict:
         """Analyse a news message (text + optional image) and return approval verdict."""
         prompt = self._build_moderation_prompt(text)
-        try:
-            verdict = await asyncio.wait_for(
-                self._gemini_call(prompt, image_data, image_mime), timeout=40
-            )
-            verdict["engine"] = "gemini-2.5-flash"
-            log.info(f"Gemini → approved={verdict['approved']} | {verdict.get('reason', '')}")
-            if verdict.get("approved") and verdict.get("formatted_text"):
-                verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
-                if not verdict["formatted_text"].startswith("TODAY'S USD HIGH IMPACT"):
-                    verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
-            return verdict
-        except Exception as exc:
-            log.warning(f"Gemini failed ({exc}) — trying Groq …")
+        # Try Gemini with retry (2 attempts)
+        for attempt in range(2):
+            try:
+                verdict = await asyncio.wait_for(
+                    self._gemini_call(prompt, image_data, image_mime), timeout=45
+                )
+                verdict["engine"] = "gemini-2.5-flash"
+                log.info(f"Gemini → approved={verdict['approved']} | {verdict.get('reason', '')}")
+                if verdict.get("approved") and verdict.get("formatted_text"):
+                    verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
+                    if not verdict["formatted_text"].startswith("TODAY'S USD HIGH IMPACT"):
+                        verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
+                return verdict
+            except asyncio.TimeoutError:
+                log.warning(f"Gemini timeout (attempt {attempt+1})")
+            except Exception as exc:
+                log.warning(f"Gemini error (attempt {attempt+1}): {exc}")
+            await asyncio.sleep(1)
 
+        # Fallback to Groq
         try:
             verdict = await asyncio.wait_for(
-                self._groq_call(prompt, image_data, image_mime), timeout=55
+                self._groq_call(prompt, image_data, image_mime), timeout=60
             )
             verdict["engine"] = "groq-llama4-scout"
             log.info(f"Groq → approved={verdict['approved']} | {verdict.get('reason', '')}")
@@ -412,15 +416,17 @@ class AIEngine:
                     verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
             return verdict
         except Exception as exc:
-            log.error(f"Both AI engines failed — safe reject.")
-            return {
-                "approved": False,
-                "reason": "Both AI engines unavailable.",
-                "issues": ["engine_error"],
-                "formatted_text": "",
-                "confidence": 0.0,
-                "engine": "none"
-            }
+            log.error(f"Groq failed: {exc}")
+
+        log.error("Both AI engines unavailable.")
+        return {
+            "approved": False,
+            "reason": "Both AI engines unavailable.",
+            "issues": ["engine_error"],
+            "formatted_text": "",
+            "confidence": 0.0,
+            "engine": "none"
+        }
 
     async def is_same_story(self, text_a: str, text_b: str,
                             image_a: Optional[bytes] = None,
@@ -580,7 +586,7 @@ def _build_post_body(text: str) -> str:
     text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text).strip()
     text = _strip_be_careful(text)
     lines = text.split('\n')
-    # Remove stray year numbers from the last few lines
+    # Remove any remaining year numbers from the last few lines (legacy)
     for i in range(max(0, len(lines) - 3), len(lines)):
         lines[i] = re.sub(r'\b\d{4}\b', '', lines[i])
     text = '\n'.join(lines)
