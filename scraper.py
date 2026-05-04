@@ -1,16 +1,14 @@
 """
 scraper.py — AXIOM INTEL channel scraper and forwarder.
-- Groups same-time events into one comma-separated line.
-- Bulletproof regex — handles all AI output variations.
-- No double signature.
-- "Be careful during these releases." in daily calendar.
-- Reminder fires for ALL red events — event-specific be-careful line.
-- All duplicate locks acquired BEFORE AI call.
-- Date format fix: "May 1" not "May 01" — matches ForexFactory image.
-- Timeouts increased for gemini-2.5-flash.
+- Pure AI-based calendar detection (no caption dependency)
+- Weekly lock resets on Sunday 2 AM EAT
+- Fixed FF calendar detection (date without year)
+- Phash locked only after AI approval
+- Flexible regex for event extraction
 """
 
 import asyncio
+import base64
 import io
 import json
 import logging
@@ -34,13 +32,6 @@ log = logging.getLogger("scraper")
 EAT = pytz.timezone("Africa/Addis_Ababa")
 _IMG_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
-_FF_CAPTION_KEYWORDS = (
-    "forexfactory", "forex factory", "calendar", "economic calendar",
-    "high impact", "impact news", "weekly news", "today news",
-    "today's news", "weekly calendar", "this week",
-    "fomc", "federal funds rate", "interest rate decision"
-)
-
 _PRIORITY_KEYWORDS = [
     "fomc", "federal open market committee", "interest rate decision",
     "rate decision", "nfp", "non-farm payroll", "non-farm payrolls",
@@ -60,16 +51,14 @@ GEOPOLITICAL_KEYWORDS = [
     "geopolitical", "oil supply", "ukraine", "russia", "biden", "putin", "xi"
 ]
 
-# ── Bulletproof event line regex ──────────────────────────────────────────────
-# Handles: leading zero, no space before PM, space before colon, double space
+# Flexible regex for event lines
 _EVENT_PATTERN = re.compile(
-    r"(🔴|🟠)\s+(\d{1,2}:\d{2}\s*[AP]M)\s*\|\s*([A-Z]{3})\s*:\s*(.+?)(?=\n|$)",
+    r"(🔴|🟠)\s+(\d{1,2}:\d{2}\s*[AP]M)\s*[|\-:]\s*([A-Z]{3})\s*[:\-]?\s*(.+?)(?=\n|$)",
     re.IGNORECASE
 )
 
 
 def _is_reminder_eligible(event: dict) -> bool:
-    """ALL red 🔴 events are eligible except geopolitical."""
     if event.get("impact") != "red":
         return False
     name_lower = event.get("name", "").lower()
@@ -107,27 +96,17 @@ def _eat_today_str() -> str:
     return _eat_now().strftime("%Y-%m-%d")
 
 
+def _eat_ai_date() -> str:
+    """Date without year for AI prompt matching FF screenshot (e.g., 'Friday, May 1')"""
+    return _eat_now().strftime("%A, %B %-d")
+
+
 def _eat_today_display() -> str:
-    # FIX: no leading zero on day — "Friday, May 1, 2026" matches "Fri May 1" in FF image
-    # Old: strftime("%A, %B %d, %Y") → "Friday, May 01, 2026" caused AI date mismatch → timeout
     return _eat_now().strftime("%A, %B %-d, %Y")
 
 
 def _eat_date_line() -> str:
-    # Post header — no year, no leading zero: "Friday, May 1"
     return _eat_now().strftime("%A, %B %-d")
-
-
-def _looks_like_ff_image(text: str) -> bool:
-    if not text:
-        return False
-    return any(kw in text.lower() for kw in _FF_CAPTION_KEYWORDS)
-
-
-def _looks_like_weekly(text: str) -> bool:
-    if not text:
-        return False
-    return any(kw in text.lower() for kw in ("week", "weekly", "this week", "next week"))
 
 
 def _normalise_urls(text: str) -> str:
@@ -163,7 +142,7 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
                 log.warning(f"Could not parse time: {repr(time_12h)}")
                 continue
         time_24h = dt.strftime("%H:%M")
-        time_12h_clean = dt.strftime("%-I:%M %p")   # "3:30 PM" not "03:30 PM"
+        time_12h_clean = dt.strftime("%-I:%M %p")   # "3:30 PM"
         raw.append({
             "name":     name.strip(),
             "currency": currency.strip(),
@@ -208,6 +187,21 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
     return result
 
 
+def _get_weekly_lock_key() -> str:
+    """
+    Returns a lock key that resets every Sunday at 2 AM EAT.
+    Format: YYYYMMDD_HHMM of the most recent Sunday at 02:00.
+    """
+    now = _eat_now()
+    # Calculate days to subtract to get to last Sunday (weekday: Monday=0, Sunday=6)
+    days_back = (now.weekday() + 1) % 7
+    last_sunday = now.replace(hour=2, minute=0, second=0, microsecond=0) - timedelta(days=days_back)
+    # If current time is before Sunday 2 AM, we are still in the previous week's cycle
+    if now < last_sunday:
+        last_sunday -= timedelta(days=7)
+    return last_sunday.strftime("%Y%m%d_%H%M")   # e.g., "20260503_0200"
+
+
 class ChannelScraper:
     def __init__(self, config: dict, ai_engine: AIEngine, memory: MemoryManager):
         self._cfg = config
@@ -231,6 +225,7 @@ class ChannelScraper:
 
         session_string = config.get("session_string", "").strip()
         if session_string:
+            from telethon.sessions import StringSession
             session = StringSession(session_string)
         else:
             session = config.get("session_name", "manager_session")
@@ -424,19 +419,19 @@ class ChannelScraper:
             except Exception as exc:
                 log.warning(f"Image download failed: {exc}")
 
-        if image_data and (
-            _looks_like_ff_image(text) or
-            await self._image_looks_like_ff(image_data, image_mime)
-        ):
-            is_weekly = _looks_like_weekly(text)
-            await self._handle_ff_image(
-                image_data, image_mime, text, is_weekly, source_channel, msg.id
-            )
-            return
+        # ── Pure AI-based calendar detection (no caption dependency) ──
+        if image_data:
+            is_ff = await self._image_looks_like_ff(image_data, image_mime)
+            if is_ff:
+                is_weekly = await self._is_weekly_image(image_data, image_mime, text)
+                await self._handle_ff_image(
+                    image_data, image_mime, text, is_weekly, source_channel, msg.id
+                )
+                return  # Handled as calendar, do not process as normal news
 
+        # Normal news handling (non-calendar)
         content_hash = self._mem.hash_combined(text, image_data)
 
-        # ── Duplicate checks ───────────────────────────────────────────────
         if await self._mem.is_duplicate(content_hash):
             log.info(f"[SKIP] Exact hash duplicate — {content_hash[:12]}…")
             return
@@ -445,7 +440,6 @@ class ChannelScraper:
             await self._mem.mark_image_seen(phash, source_channel)
             return
 
-        # ── LOCK before AI call — prevents race condition duplicates ───────
         await self._mem.mark_seen(content_hash, source=source_channel)
         if phash:
             await self._mem.mark_image_seen(phash, source_channel)
@@ -521,7 +515,7 @@ class ChannelScraper:
             )
             parts = [
                 {"inline_data": {"mime_type": image_mime,
-                                 "data": __import__('base64').b64encode(image_data).decode()}},
+                                 "data": base64.b64encode(image_data).decode()}},
                 prompt
             ]
             loop = asyncio.get_event_loop()
@@ -529,7 +523,7 @@ class ChannelScraper:
                 loop.run_in_executor(
                     None, lambda: self._ai._gemini_vision.generate_content(parts)
                 ),
-                timeout=30   # FIX: was 15s — too short for gemini-2.5-flash
+                timeout=30
             )
             import json as _json, re as _re
             raw = _re.sub(r"```+(?:json)?", "", resp.text).strip()
@@ -539,8 +533,32 @@ class ChannelScraper:
             log.warning(f"FF image check failed: {exc} — assuming not FF")
             return False
 
+    async def _is_weekly_image(self, image_data: bytes, image_mime: str, caption: str) -> bool:
+        """
+        Determine if image is a weekly calendar (whole week, not just today).
+        Uses pure AI vision; caption is ignored (kept for logging only).
+        """
+        try:
+            prompt = (
+                "Is this ForexFactory image showing a WEEKLY calendar (covering multiple days/whole week) "
+                "or just TODAY's events? Respond JSON: {\"is_weekly\": true/false}"
+            )
+            parts = [
+                {"inline_data": {"mime_type": image_mime, "data": base64.b64encode(image_data).decode()}},
+                prompt
+            ]
+            loop = asyncio.get_event_loop()
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: self._ai._gemini_vision.generate_content(parts)),
+                timeout=20
+            )
+            data = json.loads(re.sub(r"```+(?:json)?", "", resp.text).strip())
+            return data.get("is_weekly", False)
+        except Exception as exc:
+            log.warning(f"Weekly detection failed: {exc} — assuming daily")
+            return False
+
     def _select_vip_events(self, events: List[dict]) -> List[dict]:
-        """ALL red 🔴 events get reminders (except geopolitical), sorted by time."""
         eligible = [e for e in events if _is_reminder_eligible(e)]
         if not eligible:
             return []
@@ -579,7 +597,6 @@ class ChannelScraper:
         for event in vip_events:
             event_key = f"{today_str}_{event.get('name', '')}_{event.get('currency', '')}"
 
-            # Hard duplicate guard — never send same reminder twice
             if await self._mem.has_reminder_been_sent(event_key):
                 continue
 
@@ -612,7 +629,6 @@ class ChannelScraper:
         event_name = event.get("name", "Unknown Event")
         impact_emoji = "🔴" if event.get("impact") == "red" else "🟠"
 
-        # Event-specific be-careful line
         be_careful = await self._ai.get_be_careful_line(event_name)
 
         alert_text = (
@@ -638,7 +654,6 @@ class ChannelScraper:
                 log.error(f"Reminder send failed to {dest}: {exc}", exc_info=True)
             await asyncio.sleep(1)
 
-        # Mark AFTER sending
         await self._mem.mark_reminder_sent(event_key)
         await self._mem.increment_reminder_count(today_str)
         log.info(f"Reminder sent. Daily total: {await self._mem.get_reminder_count_today(today_str)}")
@@ -664,46 +679,42 @@ class ChannelScraper:
     async def _handle_ff_image(self, image_data: bytes, image_mime: str, caption: str,
                                is_weekly: bool, source_channel: str, msg_id: int):
         today_str = _eat_today_str()
-        today_display = _eat_today_display()   # "Friday, May 1, 2026" — no leading zero
+        today_ai_date = _eat_ai_date()
         phash = self._mem.compute_phash(image_data)
 
-        # ── Lock phash BEFORE AI call ──────────────────────────────────────
-        if phash:
-            if await self._mem.is_image_duplicate(phash, max_distance=3):
-                log.info(f"[SKIP] FF image phash duplicate — {phash}")
-                return
-            await self._mem.mark_image_seen(phash, source_channel)
+        # Duplicate check only (do NOT mark seen yet)
+        if phash and await self._mem.is_image_duplicate(phash, max_distance=3):
+            log.info(f"[SKIP] FF image phash duplicate — {phash}")
+            return
 
         if is_weekly:
-            now = _eat_now()
-            week_start = now + timedelta(days=(7 - now.weekday()))
-            week_end = week_start + timedelta(days=4)
-            week_range = f"{week_start.strftime('%b %-d')} – {week_end.strftime('%b %-d, %Y')}"
-            week_key = now.strftime("%Y-%W")
-            if await self._mem.has_weekly_posted(week_key):
-                log.info(f"[SKIP] Weekly already posted ({week_key}).")
+            weekly_lock_key = _get_weekly_lock_key()
+            if await self._mem.has_weekly_posted(weekly_lock_key):
+                log.info(f"[SKIP] Weekly already posted for this Sunday cycle ({weekly_lock_key}).")
                 return
-            # Lock BEFORE AI call
-            await self._mem.save_weekly_posted(week_key)
+            await self._mem.save_weekly_posted(weekly_lock_key)
             log.info("📆 Weekly FF image — analysing …")
             result = await self._ai.analyse_ff_image(
                 image_data, image_mime,
-                today_date=today_display, is_weekly=True, week_range=week_range
+                today_date=today_ai_date, is_weekly=True, week_range=""
             )
             if not result.get("approved"):
-                await self._mem.delete_weekly_posted(week_key)
+                await self._mem.delete_weekly_posted(weekly_lock_key)
                 log.info(f"[SKIP] Weekly rejected: {result.get('reason')}")
                 return
             post_text = result.get("formatted_text", "").strip()
             if not post_text:
-                await self._mem.delete_weekly_posted(week_key)
+                await self._mem.delete_weekly_posted(weekly_lock_key)
                 return
             post_text = _add_signature(post_text)
+            # Mark phash seen only after approval
+            if phash:
+                await self._mem.mark_image_seen(phash, source_channel)
             sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
             if sent:
                 log.info(f"📆 Weekly posted → msg_id={sent.id}")
             else:
-                await self._mem.delete_weekly_posted(week_key)
+                await self._mem.delete_weekly_posted(weekly_lock_key)
 
         else:
             if await self._mem.has_daily_briefing(today_str):
@@ -711,18 +722,17 @@ class ChannelScraper:
                 return
             # Lock with placeholder BEFORE AI call
             await self._mem.save_daily_briefing(today_str, -1, [])
-            log.info(f"📅 Daily FF image — analysing … (date sent to AI: {today_display})")
+            log.info(f"📅 Daily FF image — analysing … (date sent to AI: {today_ai_date})")
 
             result = await self._ai.analyse_ff_image(
                 image_data, image_mime,
-                today_date=today_display, is_weekly=False
+                today_date=today_ai_date, is_weekly=False
             )
             if not result.get("approved"):
                 await self._mem.delete_daily_briefing(today_str)
                 log.info(f"[SKIP] Daily rejected: {result.get('reason')}")
                 return
 
-            # Raw AI text — NO signature added yet
             raw_text = result.get("formatted_text", "").strip()
             if not raw_text:
                 await self._mem.delete_daily_briefing(today_str)
@@ -730,7 +740,6 @@ class ChannelScraper:
 
             log.info(f"📄 Raw AI output:\n{raw_text}")
 
-            # Parse and group events
             events = _extract_events_from_ff_text(raw_text)
 
             # Filter geopolitical
@@ -747,23 +756,22 @@ class ChannelScraper:
             self._todays_vip_events = self._select_vip_events(events)
             log.info(f"VIP reminders: {[e.get('name') for e in self._todays_vip_events]}")
 
-            # ── Build final post ───────────────────────────────────────────
-            title     = "TODAY'S USD 🇺🇸 HIGH IMPACT NEWS"   # no 📅 emoji
-            date_line = _eat_date_line()                       # "Friday, May 1"
+            # Build final post
+            title     = "TODAY'S USD 🇺🇸 HIGH IMPACT NEWS"
+            date_line = _eat_date_line()
 
             lines = [title, "", date_line, ""]
             for e in events:
                 emoji = "🔴" if e["impact"] == "red" else "🟠"
                 lines.append(f"{emoji} {e['time_12h']} | {e['currency']}: {e['name']}")
 
-            # Be careful line at the bottom
             lines.append("")
             lines.append("Be careful during these releases.")
-
             post_text = "\n".join(lines)
-            post_text = _add_signature(post_text)   # signature added ONCE
+            post_text = _add_signature(post_text)
 
-            log.info(f"📅 Final post:\n{post_text}")
+            if phash:
+                await self._mem.mark_image_seen(phash, source_channel)
 
             sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
             if sent:
