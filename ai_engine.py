@@ -1,8 +1,10 @@
+
 """
-ai_engine.py — Final version.
-- Random 💡 signature 25% of the time.
-- "Be careful" reminder lines — short, event-specific, no motivational pool.
-- "Be careful during these releases." kept in daily calendar.
+ai_engine.py — AXIOM INTEL Final Version
+- No rewriting of numbers/prices.
+- Rejects TA charts with drawn lines, indicators, annotations.
+- Hashtags only #XAUUSD, #OIL, #DXY.
+- FF calendar detection (daily/weekly) with date flexibility.
 """
 
 import asyncio
@@ -48,15 +50,10 @@ def _add_us_flag_emoji(text: str) -> str:
 
 
 def _strip_be_careful(text: str) -> str:
-    """Remove any AI-generated 'Be careful' line — we add our own controlled version."""
     return re.sub(r'\n?Be careful[^\n]*\n?', '', text, flags=re.IGNORECASE).strip()
 
 
 def _get_be_careful_line(event_name: str) -> str:
-    """
-    Short, event-specific 'be careful' line for reminders.
-    No long motivational pool — just sharp, focused warnings.
-    """
     n = event_name.lower()
     if any(kw in n for kw in ["fomc", "federal funds", "interest rate", "fed chair", "powell", "federal reserve"]):
         return "⚠️ Fed decisions move everything. Be careful — no new trades during the release."
@@ -82,7 +79,6 @@ def _get_be_careful_line(event_name: str) -> str:
         return "⚠️ Trade data can move USD unexpectedly. Be careful during the release."
     if any(kw in n for kw in ["durable goods"]):
         return "⚠️ Durable Goods can cause sharp moves. Be careful — no new entries now."
-    # General fallback for any other red event
     return "⚠️ This release can move the market strongly. Be careful — protect your capital."
 
 
@@ -112,18 +108,23 @@ These are HIGH IMPACT macroeconomic events. Always approve even if they contain 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 YOUR ONLY JOB:
-Take the source content, verify its relevance, and format it cleanly.
+Take the source content, clean it (remove markdown, extra spaces, non-essential fluff), and format it cleanly.
+Do NOT change the meaning. Do NOT rewrite headlines. Do NOT alter numbers, prices, percentages, or dollar amounts.
 Do NOT speculate. Do NOT add analysis beyond the facts.
-Do NOT change the meaning.
 
 CRITICAL FORMATTING RULES:
-- DO NOT use asterisks (*) or any markdown bolding
-- Use ONLY plain text and emojis
+- DO NOT use asterisks (*) or any markdown bolding.
+- Use ONLY plain text and emojis.
 - NO NOTE line. NO MARKET STATUS. NO commentary line.
-- Actual released figures (e.g., "came at 2.5%", "rose to 2.5%", "was 2.5%") are ALLOWED.
+- **PRESERVE EXACT NUMBERS, PRICES, PERCENTAGES, AND DOLLAR AMOUNTS** – copy them exactly as they appear.
+- **DO NOT summarise or paraphrase** – keep the original wording as close as possible. Only remove obvious spam, emojis, or markdown.
+- Actual released figures (e.g., "came at 2.5%") are ALLOWED and must be copied exactly.
 - Forecast (expected) and previous values are FORBIDDEN. Never include them.
 - Technical analysis, signals, predictions, opinions are FORBIDDEN.
 - Hashtags: Only use #XAUUSD, #DXY, or #OIL – only those relevant to the story.
+  - For gold (XAU) → #XAUUSD
+  - For USD strength/weakness → #DXY
+  - For crude oil/WTI/Brent → #OIL
 - Do NOT add the current year at the end of posts.
 - Do NOT add signature (added automatically).
 
@@ -133,22 +134,23 @@ REJECT IF ANY OF THESE APPLY:
 1. SIGNALS       — Buy/Sell/Long/Short/Entry/TP/SL/price targets
 2. CHART / TA    — Technical analysis, patterns, indicators
 3. MEME          — Memes, jokes, informal content
-4. ANALYSIS IMG  — Chart screenshots, TA images
+4. ANALYSIS IMG  — Chart screenshots with TA annotations (drawn lines, arrows, circles, RSI, MACD, support/resistance)
 5. WATERMARK     — Another channel logo or username
 6. STALE         — Content older than 18 hours
 7. OFF-TOPIC     — Not about geopolitics, central banks, macro data, Gold, Oil, USD
 8. LOW VALUE     — Vague, no specific real-world event
 9. DUPLICATE     — Same story already processed
-10. PREDICTION   — "I think", "expect", "my analysis"
+10. PREDICTION   — "I think", "expect", "my analysis", forecasts
 11. COMMENTARY   — Personal views, market opinions
 12. FORECAST/PREVIOUS — Any mention of "forecast", "expected", "previous" values
+13. TA CHART WITH MARKINGS — Any image containing drawn lines, arrows, circles, text annotations, RSI, MACD, or any indicator overlay. Only accept clean price charts that appear in news articles without analysis marks.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT (if approved):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[EMOJI] [SHORT ENGLISH HEADLINE — one line, factual]
+[EMOJI] [SHORT ENGLISH HEADLINE — one line, factual, preserving original numbers]
 
-[Source content lightly cleaned. 2-4 sentences max.]
+[Source content lightly cleaned. 2-4 sentences max. Keep exact prices/data.]
 
 [Relevant hashtags: #XAUUSD #DXY #OIL — only those that apply]
 
@@ -183,10 +185,12 @@ Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
-TODAY'S DATE: {today_date}  (verify the calendar shows this exact date)
+EXPECTED DATE: {today_date} (example: "Friday, May 1" — no year).
+The screenshot may show the same date with or without the year. Ignore the year if present.
+Only approve if the date matches (day and month), regardless of year.
 
 INSTRUCTIONS:
-1. Check the date in the screenshot — must match {today_date}. If not → reject.
+1. Check the date in the screenshot — must match {today_date} (year optional). If not → reject.
 2. Extract ALL USD high-impact (🔴) and medium-impact (🟠) events.
    Write EACH event on its OWN separate line — even if same time.
 3. Do NOT include the year in the date line (e.g. "Thursday, April 30").
@@ -279,7 +283,6 @@ def _validate_and_clean(data: dict) -> dict:
         data["formatted_text"] = re.sub(
             r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", data["formatted_text"]
         ).strip()
-        # Strip any AI-generated "Be careful" line — scraper adds its own
         data["formatted_text"] = _strip_be_careful(data["formatted_text"])
         text = data["formatted_text"]
         if "TODAY'S USD HIGH IMPACT" in text or "WEEKLY HIGH IMPACT" in text:
@@ -289,6 +292,16 @@ def _validate_and_clean(data: dict) -> dict:
             hashtags = re.findall(r"#\w+", text)
             allowed_hashtags = [h for h in hashtags if h in ALLOWED_HASHTAGS_SET]
             text = re.sub(r"#\w+", "", text).strip()
+            # Auto-add based on content
+            if re.search(r'\bgold\b|\bxau\b', text, re.IGNORECASE):
+                if "#XAUUSD" not in allowed_hashtags:
+                    allowed_hashtags.append("#XAUUSD")
+            if re.search(r'\boil\b|\bwti\b|\bbrent\b', text, re.IGNORECASE):
+                if "#OIL" not in allowed_hashtags:
+                    allowed_hashtags.append("#OIL")
+            if re.search(r'\bdxy\b|\busd\b', text, re.IGNORECASE):
+                if "#DXY" not in allowed_hashtags:
+                    allowed_hashtags.append("#DXY")
             if allowed_hashtags:
                 text = text + "\n\n" + " ".join(allowed_hashtags)
             data["formatted_text"] = text
@@ -445,7 +458,7 @@ class AIEngine:
             loop = asyncio.get_event_loop()
             resp = await asyncio.wait_for(
                 loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)),
-                timeout=45
+                timeout=60
             )
             data = _parse_json(resp.text)
             log.info(f"FF image → approved={data.get('approved')} | {data.get('reason', '')}")
@@ -465,7 +478,7 @@ class AIEngine:
                     messages=[{"role": "user", "content": content}],
                     temperature=0.1, max_tokens=800,
                 ),
-                timeout=60,
+                timeout=75,
             )
             data = _parse_json(resp.choices[0].message.content)
             log.info(f"Groq FF → approved={data.get('approved')}")
@@ -477,7 +490,6 @@ class AIEngine:
             return {"approved": False, "reason": "AI engines unavailable for image analysis."}
 
     async def get_be_careful_line(self, event_name: str) -> str:
-        """Return the short event-specific be-careful line for reminders."""
         return _get_be_careful_line(event_name)
 
     def _build_moderation_prompt(self, text: str) -> str:
