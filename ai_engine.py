@@ -143,33 +143,69 @@ ALWAYS REJECT:
 NOTE: If content contains another channel username or link — IGNORE it, treat the news itself on its merits.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FORMAT (approved posts only):
+REWRITING RULES — CRITICAL:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[EMOJI] [SHORT FACTUAL HEADLINE]
+GOAL: Make it look like OUR channel posted it — with MINIMAL changes only.
 
-[2-4 sentences. Real numbers allowed. No forecast. No previous.]
+DO:
+- Keep original wording as close as possible
+- Fix grammar/spelling only if clearly wrong
+- Remove other channel watermarks, usernames, links
+- Keep all real numbers exactly as they appear in source
+- Keep the original structure and sentence order
 
-ADD HASHTAGS INLINE — no label, no "HASHTAGS:" word, just the tags on their own line:
-- Affects Gold → #XAUUSD
-- Affects USD/Dollar → #DXY
-- Affects Oil → #OIL
-- FOMC/Fed → always #DXY #XAUUSD
-- Geopolitical/war → depends on impact
-- Never add any other hashtag
+DO NOT:
+- Do NOT rewrite sentences into new ones
+- Do NOT add ANY information the source did not say
+- Do NOT add words like "may", "could", "might", "expected", "likely"
+- Do NOT add context, background, or explanation not in the source
+- Do NOT summarise or shorten — keep ALL original content
+- Do NOT change the meaning of any sentence
+- Do NOT add emojis the source did not have (keep source emojis)
 
-CORRECT EXAMPLE:
-🚨 Iranian drones hit UAE vessel in Hormuz.
+WRONG — adding prediction not in source:
+Source: "Trump announces 50% tariffs on EU"
+Bad output: "Trump announces 50% tariffs on EU. This could spark a trade war and hurt global growth."
+→ The second sentence was invented. NEVER do this.
 
-The incident occurred in the Hormuz Strait, a critical oil waterway.
-Iran's involvement may trigger further sanctions or retaliation.
+CORRECT — minimal change:
+Source: "Trump announces 50% tariffs on EU goods starting June"
+Good output: "Trump announces 50% tariffs on EU goods starting June"
+→ Kept exactly. Only watermark removed if present.
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HASHTAG RULES — STRICT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Only add hashtags when the news is DIRECTLY and CLEARLY about that asset.
+
+#XAUUSD → ONLY if news directly mentions Gold, XAU, safe-haven
+#DXY    → ONLY if news directly mentions USD, Dollar, Fed, FOMC, US rates
+#OIL    → ONLY if news directly mentions Oil, crude, OPEC, energy, Hormuz
+
+FOMC/Fed rate decision → always #DXY #XAUUSD
+Gold price news → #XAUUSD only (not #DXY unless Dollar explicitly mentioned)
+Oil supply news → #OIL only
+Geopolitical war news → only if oil/gold explicitly affected in the source
+
+DO NOT add hashtags just because the news is "related" or "could affect" an asset.
+The source must explicitly mention it.
+Never add any hashtag other than #XAUUSD #DXY #OIL.
+No "HASHTAGS:" label — just put the tags on their own line at the end.
+
+CORRECT HASHTAG EXAMPLE:
+🚨 Iranian drones hit UAE vessel in Hormuz strait.
+Oil tanker traffic disrupted as tensions escalate.
+
+#OIL
+
+WRONG — do not add extra tags not in source:
+🚨 Iranian drones hit UAE vessel.
 #OIL #XAUUSD #DXY
+→ Gold and Dollar not mentioned in source — do not add.
 
-WRONG — never write the word HASHTAGS:
-HASHTAGS:
-#OIL #XAUUSD
-
-EMOJI: 🚨 🌍 📊 🏦 🛢️ 🏆 💵 ⚠️ 🗳️ 🇺🇸
+EMOJI: Only keep emoji from source. If source has none, add ONE relevant emoji:
+🚨 breaking/urgent  🌍 geopolitical  📊 data release
+🏦 central bank  🛢️ oil  🏆 gold  💵 dollar  ⚠️ warning  🗳️ political  🇺🇸 US
 
 DO NOT add signature. DO NOT add year. NO asterisks. NO bold.
 
@@ -497,8 +533,13 @@ class AIEngine:
             \"\"\"
             {text.strip() if text else "(image only)"}
             \"\"\"
-            Analyse. If real geopolitical/macro news OR actual released data OR price level hit → approve and format.
+            Analyse this content.
+            If real geopolitical/macro news OR actual released data OR price level hit → approve.
             If forecast/previous only/signal/TA/chart/meme/sentiment/stale → reject.
+
+            IMPORTANT: If approved, copy the source text with MINIMAL changes only.
+            Do NOT rewrite. Do NOT add sentences. Do NOT add predictions or context.
+            Only remove watermarks. Fix grammar only if clearly wrong. Keep all numbers exact.
             Return JSON.
         """).strip()
 
