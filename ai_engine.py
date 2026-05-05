@@ -268,14 +268,58 @@ Respond ONLY with JSON:
 """
 
 _SIMILARITY_PROMPT = """
-Compare these two news stories. Are they about the same real-world event?
-Even if worded differently or from different sources.
+You are a strict duplicate news detector for a financial news channel.
+
+Your job: decide if Story A and Story B are reporting the SAME real-world event.
+
+RULES:
+- Same event = same entity + same action + same context (even if worded differently)
+- Different wording, different source, different language = still SAME if the core fact is identical
+- Similar topic but different specific event = NOT same
+- If images are provided, compare visual content too (headlines, numbers, screenshots)
+
+EXAMPLES OF SAME (mark true):
+  A: "Trump announces 50% tariffs on EU"
+  B: "White House confirms 50 percent EU tariff"  → same_story: true
+
+  A: "Fed holds rates at 4.5%"
+  B: "FOMC keeps interest rate unchanged at 4.25-4.50"  → same_story: true
+
+  A: "Gold hits $3,400"
+  B: "XAU/USD reaches 3400 for first time"  → same_story: true
+
+EXAMPLES OF DIFFERENT (mark false):
+  A: "Trump threatens EU tariffs"
+  B: "Trump signs China tariff deal"  → same_story: false (different target)
+
+  A: "Fed holds rates May 2025"
+  B: "Fed holds rates March 2025"  → same_story: false (different meeting)
 
 Story A: {story_a}
 Story B: {story_b}
 
-Be aggressive — if any reasonable chance they are same, mark true.
-JSON: {{"same_story": true/false, "confidence": 0.0-1.0, "reason": "..."}}
+Be STRICT. Only mark true if genuinely the same event.
+Respond ONLY with JSON:
+{{"same_story": true/false, "confidence": 0.0-1.0, "reason": "one line explanation"}}
+"""
+
+_SIMILARITY_IMAGE_PROMPT = """
+You are a strict duplicate news detector for a financial news channel.
+
+Two news posts are shown — they may be text, images, or both.
+Decide if they report the SAME real-world event.
+
+Story A text: {story_a}
+Story B text: {story_b}
+
+Also examine any images provided carefully — compare headlines, numbers, tickers shown.
+
+SAME = same entity + same action + same core fact (even if worded differently or from different sources)
+NOT SAME = similar topic but different specific event, different date, different country
+
+Be STRICT. Only mark true if genuinely the same event.
+Respond ONLY with JSON:
+{{"same_story": true/false, "confidence": 0.0-1.0, "reason": "one line explanation"}}
 """
 
 
@@ -581,40 +625,139 @@ class AIEngine:
     async def is_same_story(self, text_a: str, text_b: str,
                             image_a: Optional[bytes] = None,
                             image_b: Optional[bytes] = None) -> bool:
-        if not text_a and not text_b:
+        """
+        Multi-layer duplicate detection.
+        Layer 1: Fast keyword hash — no AI, instant.
+        Layer 2: Gemini vision — both images + both texts.
+        Layer 3: Groq fallback — both images + both texts.
+        Confidence threshold: 0.75 (strict).
+        """
+
+        # ── Normalise text ────────────────────────────────────────────────────
+        def _normalise(t: str) -> str:
+            if not t:
+                return ""
+            t = t.lower()
+            t = _strip_watermarks(t)
+            t = re.sub(r"[^\w\s]", " ", t)   # strip punctuation
+            t = re.sub(r"\s+", " ", t).strip()
+            return t
+
+        norm_a = _normalise(text_a)
+        norm_b = _normalise(text_b)
+
+        # ── Layer 1a: Exact hash match (text only, instant) ───────────────────
+        if norm_a and norm_b and norm_a == norm_b:
+            log.info("Duplicate detected: exact text match")
+            return True
+
+        # ── Layer 1b: Key phrase overlap (fast, no AI) ────────────────────────
+        if norm_a and norm_b:
+            words_a = set(norm_a.split())
+            words_b = set(norm_b.split())
+            # Remove common stop words
+            stops = {
+                "the","a","an","is","are","was","were","in","on","at","to",
+                "of","and","or","for","with","as","by","from","that","this",
+                "it","its","be","been","has","have","had","will","said","says"
+            }
+            keys_a = words_a - stops
+            keys_b = words_b - stops
+            if keys_a and keys_b:
+                overlap = len(keys_a & keys_b) / min(len(keys_a), len(keys_b))
+                if overlap >= 0.80:
+                    log.info(f"Duplicate detected: keyword overlap {overlap:.0%}")
+                    return True
+                # Very low overlap + no images = definitely not same
+                if overlap < 0.10 and not image_a and not image_b:
+                    log.info(f"Not duplicate: keyword overlap too low {overlap:.0%}")
+                    return False
+
+        # ── Layer 1c: Image-only posts — don't skip, send to AI ───────────────
+        has_content = norm_a or norm_b or image_a or image_b
+        if not has_content:
             return False
-        prompt = _SIMILARITY_PROMPT.format(
-            story_a=(text_a[:500] if text_a else ""),
-            story_b=(text_b[:500] if text_b else ""),
+
+        # ── Build prompts ─────────────────────────────────────────────────────
+        has_images = image_a or image_b
+        prompt = (
+            _SIMILARITY_IMAGE_PROMPT if has_images else _SIMILARITY_PROMPT
+        ).format(
+            story_a=(norm_a[:800] if norm_a else "(image only)"),
+            story_b=(norm_b[:800] if norm_b else "(image only)"),
         )
+
+        # ── Layer 2: Gemini vision — both images ──────────────────────────────
         try:
             parts = []
             if image_a:
-                parts.append({"inline_data": {"mime_type": "image/jpeg", "data": _b64(image_a)}})
+                parts.append({
+                    "inline_data": {"mime_type": "image/jpeg", "data": _b64(image_a)}
+                })
+            if image_b:
+                parts.append({
+                    "inline_data": {"mime_type": "image/jpeg", "data": _b64(image_b)}
+                })
             parts.append(prompt)
+
             loop = asyncio.get_running_loop()
             resp = await asyncio.wait_for(
                 loop.run_in_executor(
                     None, lambda: self._gemini_vision.generate_content(parts)
                 ),
-                timeout=20
+                timeout=25,
             )
             data = _parse_json(resp.text)
-            return bool(data.get("same_story", False)) and data.get("confidence", 0) >= 0.55
-        except Exception:
-            pass
+            confidence = data.get("confidence", 0)
+            same = bool(data.get("same_story", False))
+            log.info(
+                f"Gemini similarity: same={same} confidence={confidence:.2f} "
+                f"reason={data.get('reason', '')}"
+            )
+            if same and confidence >= 0.75:
+                return True
+            if not same and confidence >= 0.75:
+                return False
+            # Low confidence — fall through to Groq for second opinion
+        except Exception as e:
+            log.warning(f"Gemini similarity failed: {e}")
+
+        # ── Layer 3: Groq fallback — both images via base64 url ───────────────
         try:
+            content: list = []
+            if image_a:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{_b64(image_a)}"},
+                })
+            if image_b:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{_b64(image_b)}"},
+                })
+            content.append({"type": "text", "text": prompt})
+
             resp = await asyncio.wait_for(
                 self._groq.chat.completions.create(
                     model="meta-llama/llama-4-scout-17b-16e-instruct",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.1, max_tokens=300,
+                    messages=[{"role": "user", "content": content}],
+                    temperature=0.1,
+                    max_tokens=300,
                 ),
-                timeout=25,
+                timeout=30,
             )
             data = _parse_json(resp.choices[0].message.content)
-            return bool(data.get("same_story", False)) and data.get("confidence", 0) >= 0.55
-        except Exception:
+            confidence = data.get("confidence", 0)
+            same = bool(data.get("same_story", False))
+            log.info(
+                f"Groq similarity: same={same} confidence={confidence:.2f} "
+                f"reason={data.get('reason', '')}"
+            )
+            return same and confidence >= 0.75
+        except Exception as e:
+            log.warning(f"Groq similarity failed: {e}")
+            # Both engines failed — safe default: treat as NOT duplicate
+            # (better to post a duplicate than block real news)
             return False
 
     async def get_be_careful_line(self, event_name: str) -> str:
