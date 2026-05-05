@@ -138,7 +138,7 @@ HASHTAGS — add ALL that apply:
 - Geopolitical/war → depends on impact
 - Never add any other hashtag
 
-EMOJI: 🚨 🌍 📊 🏦 🛢️ 🏆 💵 ⚠️ 🗳️
+EMOJI: 🚨 🌍 📊 🏦 🛢️ 🏆 💵 ⚠️ 🗳️ 🇺🇸
 
 DO NOT add signature. DO NOT add year. NO asterisks. NO bold.
 
