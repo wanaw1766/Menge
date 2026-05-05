@@ -1,7 +1,7 @@
 """
 ai_engine.py — AXIOM INTEL AI Engine.
 - Gemini primary, Groq fallback with retry.
-- Hard blocks: signals, sentiment, watermark, injection.
+- Hard blocks: signals, sentiment, injection. Watermarks stripped silently.
 - Hashtags: #XAUUSD #DXY #OIL only where relevant, no "HASHTAGS:" label.
 - FF calendar: daily once/day, weekly once/week.
 - Geopolitical/FOMC always approved.
@@ -55,6 +55,18 @@ def _strip_hashtag_label(text: str) -> str:
     return re.sub(r"HASHTAGS?\s*[:\-]?\s*\n?", "", text, flags=re.IGNORECASE).strip()
 
 
+def _strip_watermarks(text: str) -> str:
+    """Silently remove any @username or t.me/channel links (except our own)."""
+    # Remove t.me/links except Squad_4xx
+    text = re.sub(r"t\.me/(?!Squad_4xx)[a-zA-Z0-9_]+", "", text, flags=re.IGNORECASE)
+    # Remove @usernames except @Squad_4xx
+    text = re.sub(r"@(?!Squad_4xx)[a-zA-Z0-9_]{4,}", "", text, flags=re.IGNORECASE)
+    # Clean up any leftover double spaces or orphaned punctuation from removal
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 # ── Hard block patterns ───────────────────────────────────────────────────────
 _SIGNAL_RE = re.compile(
     r"\b(buy|sell|long|short|entry|tp|take[\s_-]?profit|sl|"
@@ -92,8 +104,6 @@ def _hard_block(text: str) -> Optional[str]:
         return "signal_content"
     if _SENTIMENT_RE.search(text):
         return "sentiment_content"
-    if _WATERMARK_RE.search(text):
-        return "watermark_content"
     if _INJECTION_RE.search(text):
         return "injection_attempt"
     return None
@@ -113,20 +123,24 @@ ALWAYS APPROVE — NO EXCEPTIONS:
 4. Geopolitical events: war, missile, strike, sanctions, Hormuz, Ukraine
 5. Actual released economic data with real numbers:
    "CPI came at 2.8%", "NFP 250K", "GDP rose 2.1%", "raised by 25bps"
+6. Price level hits — "Gold hit $3,400", "Oil broke $90", "DXY at 104"
+7. Trump / world leader statements on USD, trade, tariffs, economy
+8. War, sanctions, geopolitical conflict and their effect on markets
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ALWAYS REJECT:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. Signals — Buy/Sell/Long/Short/Entry/TP/SL
-2. Technical analysis — patterns, indicators, charts
+2. Technical analysis — patterns, indicators, RSI, MACD, Fibonacci, support/resistance levels
 3. Memes, jokes, informal content
-4. Chart screenshots, TA images
-5. Another channel watermark or username
-6. Content older than 18 hours
-7. Forecast/Previous values — "forecast 180K", "previous 2.3%"
-8. Opinions — "I think", "expect", "my analysis"
-9. Sentiment — Fear & Greed, COT, smart money, VIX
-10. Bank sentiment — "banks are bullish/bearish"
+4. Chart screenshots or any chart image (TradingView or otherwise)
+5. Content older than 18 hours
+6. Forecast/Previous values only — "forecast 180K", "previous 2.3%" (reject ONLY if NO real released number is present)
+7. Opinions — "I think", "expect", "my analysis"
+8. Sentiment — Fear & Greed, COT, smart money, VIX
+9. Bank sentiment — "banks are bullish/bearish"
+
+NOTE: If content contains another channel username or link — IGNORE it, treat the news itself on its merits.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT (approved posts only):
@@ -331,6 +345,7 @@ def _validate_and_clean(data: dict) -> dict:
     if data.get("formatted_text"):
         text = data["formatted_text"]
         text = text.replace("*", "")
+        text = _strip_watermarks(text)
         text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text)
         text = _strip_be_careful(text)
         text = _strip_hashtag_label(text)
@@ -375,6 +390,7 @@ def _build_post_body(text: str) -> str:
     if not text:
         return ""
     text = text.replace("*", "")
+    text = _strip_watermarks(text)
     text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text)
     text = _strip_be_careful(text)
     text = _strip_hashtag_label(text)
@@ -423,12 +439,12 @@ class AIEngine:
 
         # Pre-filter source text before AI — saves quota
         if text:
+            # Strip watermarks silently before AI sees the text
+            text = _strip_watermarks(text)
             if _SENTIMENT_RE.search(text):
                 return _reject("Sentiment indicator blocked", "sentiment_content")
             if _INJECTION_RE.search(text):
                 return _reject("Prompt injection blocked", "injection_attempt")
-            if _WATERMARK_RE.search(text):
-                return _reject("Watermark blocked", "watermark_content")
 
         prompt = textwrap.dedent(f"""
             DATE (UTC): {_today_str()}
@@ -437,8 +453,8 @@ class AIEngine:
             \"\"\"
             {text.strip() if text else "(image only)"}
             \"\"\"
-            Analyse. If real geopolitical/macro news OR actual released data → approve and format.
-            If forecast/previous/signal/TA/meme/sentiment/stale → reject.
+            Analyse. If real geopolitical/macro news OR actual released data OR price level hit → approve and format.
+            If forecast/previous only/signal/TA/chart/meme/sentiment/stale → reject.
             Return JSON.
         """).strip()
 
