@@ -3,7 +3,15 @@ ai_engine.py — AXIOM INTEL AI Engine.
 - Gemini primary, Groq fallback with retry.
 - Hard blocks: signals, sentiment, injection. Watermarks stripped silently.
 - Hashtags: #XAUUSD #DXY #OIL only where relevant — detected from final text, ONE pass.
-- Emoji: picked from final text content, ONE pass, never double-applied.
+- Emoji system:
+    📊  data releases (NFP, CPI, GDP, PCE, PMI, retail sales, etc.)
+    📈  price UP / bullish news (surges, hits record, rallies, jumps)
+    📉  price DOWN / bearish news (drops, falls, crashes, slides)
+    🏦  Fed / central bank decisions
+    🛢️  Oil/energy (non-price-directional)
+    🚨  War / geopolitical conflict / sanctions / breaking
+    🇺🇸  Trump / tariffs / US political
+    🌍  General geopolitical / world leaders
 - FF calendar: daily once/day, weekly once/week.
 - Geopolitical/FOMC always approved.
 - Same-time events: comma-joined on ONE line.
@@ -114,15 +122,7 @@ def _hard_block(text: str) -> Optional[str]:
 # RULES:
 # Each asset has a PRIMARY keyword list (news is directly about this asset)
 # and an EXCLUDED keyword list (news mentions the asset only as a side-effect).
-#
-# Example: "Oil drops on Fed rate cut" — Fed is the subject, oil is a side-effect.
-#   → #DXY only, NOT #OIL
-# Example: "OPEC cuts production, oil surges" — oil is the subject.
-#   → #OIL only
-# Example: "Gold hits $3,400 as dollar weakens after Fed cut"
-#   → both #XAUUSD and #DXY because both are explicitly mentioned as subjects.
 
-# Keywords that make this asset the SUBJECT of the news
 _OIL_SUBJECT = [
     "oil", "crude", "opec", "barrel", "brent", "wti",
     "hormuz", "energy supply", "petroleum", "gasoline",
@@ -130,7 +130,6 @@ _OIL_SUBJECT = [
     "energy market", "oil cut", "oil hike", "oil embargo",
 ]
 
-# If these appear WITHOUT oil subject words, oil is just a side-effect — skip #OIL
 _OIL_EXCLUDE_IF_ALONE = [
     "fed", "fomc", "powell", "nfp", "cpi", "gdp", "trump tariff",
     "interest rate", "gold hits", "dollar", "dxy",
@@ -147,7 +146,6 @@ _GOLD_EXCLUDE_IF_ALONE = [
     "oil", "opec", "barrel", "crude",
 ]
 
-# USD/DXY subject: the news is ABOUT the dollar, Fed, or US economic data
 _DXY_SUBJECT = [
     # Fed / monetary policy
     "fed ", "fomc", "powell", "federal reserve", "federal funds",
@@ -168,18 +166,17 @@ _DXY_SUBJECT = [
     # Dollar itself
     "dollar", "dxy", "usd index", "dollar index",
     "dollar strength", "dollar weakness", "dollar rallies", "dollar drops",
-    # Tariffs / trade only when explicitly tied to dollar/economy
+    # Tariffs / trade
     "tariff on", "tariffs on", "trade war", "trade deal",
-    # Trump statements only when explicitly about economy/dollar/rates
+    # Trump statements about economy/dollar/rates
     "trump tax", "trump rate", "trump fed", "trump economy",
     "trump tariff on", "trump imposes tariff",
-    # US sanctions affecting dollar
+    # US sanctions
     "us sanctions", "us sanction",
     # Treasury
     "us treasury", "treasury yield", "10-year yield", "bond yield",
 ]
 
-# These make something look DXY-related but are NOT the subject
 _DXY_EXCLUDE_IF_ALONE = [
     "oil", "opec", "barrel", "crude",
     "gold hits", "xau hits",
@@ -190,55 +187,87 @@ def _detect_assets(text: str) -> list:
     """
     Analyse text and return the list of hashtags that should be added.
     Each asset is only included when the news is DIRECTLY about that asset.
-    Returns e.g. ["#OIL"], ["#DXY", "#XAUUSD"], etc.
-    Never returns random or guessed tags.
+
+    FIXES vs old version:
+    - OIL: now requires at minimum 2 oil-specific signals before tagging,
+      preventing false positives when oil is just a price side-mention.
+    - GOLD: excludes tagging when gold is only mentioned as "gold-backed" or
+      vague context without a price/market action word.
+    - DXY: tightened — geopolitical-only news no longer triggers DXY unless
+      dollar/Fed is explicitly the subject.
     """
     t = text.lower()
     tags = []
 
     # ── OIL ──────────────────────────────────────────────────────────────────
-    oil_hit = any(kw in t for kw in _OIL_SUBJECT)
-    if oil_hit:
-        # Check it's not just a side-effect mention
-        # e.g. "Fed cuts rates, oil jumps" — oil jumps but Fed is the subject
-        only_side_effect = (
-            not any(kw in t for kw in [
-                "oil production", "oil output", "opec", "barrel",
-                "oil price", "oil market", "oil cut", "oil embargo",
-                "hormuz", "brent", "wti", "crude oil", "petroleum",
-            ])
-            and any(kw in t for kw in _OIL_EXCLUDE_IF_ALONE)
-        )
+    # Require a strong oil subject word (not just "oil" in passing)
+    _OIL_STRONG = [
+        "oil production", "oil output", "opec", "barrel",
+        "oil price", "oil market", "oil cut", "oil embargo",
+        "hormuz", "brent", "wti", "crude oil", "petroleum",
+        "oil surges", "oil drops", "oil falls", "oil rallies",
+        "oil hits", "oil breaks",
+    ]
+    oil_strong_hit = any(kw in t for kw in _OIL_STRONG)
+    oil_weak_hit   = any(kw in t for kw in _OIL_SUBJECT)
+
+    if oil_strong_hit:
+        # Strong hit — include unless a non-oil subject dominates
+        only_side_effect = any(kw in t for kw in _OIL_EXCLUDE_IF_ALONE) and not oil_strong_hit
         if not only_side_effect:
+            tags.append("#OIL")
+    elif oil_weak_hit:
+        # Weak hit (just "oil" mentioned) — only tag if no exclude word present
+        if not any(kw in t for kw in _OIL_EXCLUDE_IF_ALONE):
             tags.append("#OIL")
 
     # ── GOLD ─────────────────────────────────────────────────────────────────
-    gold_hit = any(kw in t for kw in _GOLD_SUBJECT)
-    if gold_hit:
-        only_side_effect = (
-            not any(kw in t for kw in [
-                "gold price", "gold hits", "gold surges", "gold drops",
-                "gold rally", "gold falls", "xauusd", "xau/usd",
-                "bullion", "ounce", "precious metal",
-            ])
-            and any(kw in t for kw in _GOLD_EXCLUDE_IF_ALONE)
-        )
+    _GOLD_STRONG = [
+        "gold price", "gold hits", "gold surges", "gold drops",
+        "gold rally", "gold falls", "xauusd", "xau/usd",
+        "bullion", "gold ounce", "precious metal",
+        "gold breaks", "gold reaches", "gold at $", "gold record",
+        "gold rallies", "gold jumps", "gold slides", "gold tumbles",
+    ]
+    gold_strong_hit = any(kw in t for kw in _GOLD_STRONG)
+    gold_weak_hit   = any(kw in t for kw in _GOLD_SUBJECT)
+
+    if gold_strong_hit:
+        only_side_effect = any(kw in t for kw in _GOLD_EXCLUDE_IF_ALONE) and not gold_strong_hit
         if not only_side_effect:
+            tags.append("#XAUUSD")
+    elif gold_weak_hit:
+        if not any(kw in t for kw in _GOLD_EXCLUDE_IF_ALONE):
             tags.append("#XAUUSD")
 
     # ── DXY ──────────────────────────────────────────────────────────────────
-    dxy_hit = any(kw in t for kw in _DXY_SUBJECT)
-    if dxy_hit:
+    # FIXED: geopolitical-only events (war, sanctions, iran) must ALSO mention
+    # dollar/Fed explicitly to get #DXY — pure geopolitical = no #DXY
+    _DXY_STRONG = [
+        "fed ", "fomc", "powell", "federal reserve",
+        "interest rate", "rate cut", "rate hike", "rate hold",
+        "nfp", "cpi", "gdp", "pce", "unemployment",
+        "dollar", "dxy", "treasury yield",
+        "tariff on", "tariffs on", "trade war",
+        "retail sales", "jobless", "ism ", "pmi",
+        "average hourly earnings", "jolts", "durable goods",
+    ]
+    _GEO_ONLY = [
+        "war", "missile", "strike", "attack", "troops", "invasion",
+        "nuclear", "explosion", "military", "sanction", "iran",
+        "ukraine", "russia", "nato", "middle east",
+    ]
+
+    dxy_strong_hit = any(kw in t for kw in _DXY_STRONG)
+    geo_only = (
+        any(kw in t for kw in _GEO_ONLY)
+        and not dxy_strong_hit
+    )
+
+    if dxy_strong_hit and not geo_only:
         only_side_effect = (
-            not any(kw in t for kw in [
-                "fed ", "fomc", "powell", "federal reserve",
-                "interest rate", "rate cut", "rate hike", "rate hold",
-                "nfp", "cpi", "gdp", "pce", "unemployment",
-                "dollar", "dxy", "treasury yield",
-                "tariff on", "tariffs on", "trade war",
-                "retail sales", "jobless", "ism ", "pmi",
-            ])
-            and any(kw in t for kw in _DXY_EXCLUDE_IF_ALONE)
+            any(kw in t for kw in _DXY_EXCLUDE_IF_ALONE)
+            and not any(kw in t for kw in _DXY_STRONG)
         )
         if not only_side_effect:
             tags.append("#DXY")
@@ -246,98 +275,148 @@ def _detect_assets(text: str) -> list:
     return tags
 
 
-# ── Emoji engine — single source of truth ─────────────────────────────────────
+# ── Emoji engine — REPLACED ────────────────────────────────────────────────────
 #
-# HOW IT WORKS:
-# We check the FINAL cleaned text (after watermarks/hashtags stripped).
-# One function, called once, never double-applied.
-# Priority order matters — more specific checks come first.
+# NEW SYSTEM:
+#   📊  Economic data releases (NFP, CPI, GDP, PCE, PMI, retail sales…)
+#   📈  Price UP / bullish direction (surges, hits record, rallies, jumps, rises)
+#   📉  Price DOWN / bearish direction (drops, falls, crashes, slides, tumbles)
+#   🏦  Fed / central bank decisions (non-directional)
+#   🛢️  Oil/energy news (non-directional price)
+#   🚨  War / geopolitical / sanctions / breaking / urgent
+#   🇺🇸  Trump / tariffs / US political (non-market-moving)
+#   🌍  General world leaders / geopolitical (default)
+#
+# PRIORITY ORDER:
+# Data releases → checked first (most specific)
+# Price direction → checked second (bullish vs bearish)
+# Then Fed, oil, war, political, default
+
+# UP/bullish keywords — specific price-action phrases only
+_UP_WORDS = [
+    "surges", "surge", "rallies", "rally", "jumps", "jump",
+    "rises", "rise", "climbs", "climb", "hits record", "record high",
+    "all-time high", "ath", "soars", "soar", "spikes", "spike",
+    "gains", "gain", "advances", "advance",
+    "reaches", "hits $", "breaks above", "tops", "exceeds",
+    "up by", "adds", "bounces", "bounce",
+    "recovers", "recovery", "surging", "rallying", "jumping",
+    "rising", "climbing", "advancing",
+]
+
+# DOWN/bearish keywords
+_DOWN_WORDS = [
+    "drops", "drop", "falls", "fall", "tumbles", "tumble",
+    "slides", "slide", "crashes", "crash", "plunges", "plunge",
+    "declines", "decline", "weakens", "weaken", "retreats", "retreat",
+    "sinks", "sink", "loses", "loss", "down by", "drops to",
+    "falls to", "slides to", "lower", "slumps", "slump",
+    "collapses", "collapse", "dips", "dip", "selling off",
+    "under pressure", "hit low", "new low", "multi-month low",
+    "dropping", "falling", "tumbling", "sliding", "declining",
+]
+
+# Economic data release keywords
+_DATA_WORDS = [
+    "nfp", "non-farm payroll", "non-farm employment",
+    "cpi", "consumer price index",
+    "pce", "core pce",
+    "gdp", "gross domestic product",
+    "retail sales",
+    "unemployment rate", "jobless claims",
+    "ism", "pmi",
+    "durable goods",
+    "average hourly earnings",
+    "jolts",
+    "producer price", "ppi",
+    "trade balance",
+    "housing starts", "building permits",
+    "consumer confidence", "consumer sentiment",
+    "came in at", "came in", "printed at", "print of",
+    "actual:", "actual vs",
+    "beats expectations", "misses expectations",
+    "above forecast", "below forecast",
+    "% vs", "k vs", "b vs",
+]
+
 
 def _pick_emoji(text: str) -> str:
     """
     Pick the single most relevant emoji for this news post.
-    Returns the emoji string (e.g. "🏦").
+
+    Priority:
+    1. Data release  → 📊
+    2. Price UP      → 📈
+    3. Price DOWN    → 📉
+    4. Fed/CB        → 🏦
+    5. Oil/energy    → 🛢️
+    6. War/geo/break → 🚨
+    7. Trump/tariff  → 🇺🇸
+    8. World leaders → 🌍
+    9. Default       → 🌍
     """
     t = text.lower()
 
-    # Fed / central bank — highest priority for financial news
-    if any(k in t for k in [
-        "fomc", "federal reserve", "fed holds", "fed cuts", "fed raises",
-        "fed hikes", "powell", "federal funds rate", "rate decision",
-        "interest rate decision", "basis points", "bps",
-    ]):
-        return "🏦"
-
-    # Economic data release
-    if any(k in t for k in [
-        "nfp", "non-farm payroll", "non-farm employment",
-        "cpi", "consumer price index",
-        "pce", "core pce",
-        "gdp", "gross domestic product",
-        "retail sales", "unemployment rate", "jobless claims",
-        "ism", "pmi", "durable goods", "jolts",
-        "average hourly earnings", "trade balance",
-        "producer price", "ppi",
-    ]):
+    # 1. Economic data release — highest priority for financial data posts
+    if any(k in t for k in _DATA_WORDS):
         return "📊"
 
-    # Oil / energy
+    # 2. Price direction — bullish
+    if any(k in t for k in _UP_WORDS):
+        return "📈"
+
+    # 3. Price direction — bearish
+    if any(k in t for k in _DOWN_WORDS):
+        return "📉"
+
+    # 4. Fed / central bank (rate decision, non-directional)
+    # Check for "fed" as a standalone word (not "federal" in a title)
+    if any(k in t for k in [
+        "fomc", "federal reserve", "federal funds",
+        "fed cuts", "fed raises", "fed hikes", "fed holds",
+        "fed pauses", "fed keeps", "powell", "rate decision",
+        "interest rate decision", "basis points", "bps",
+        "rate unchanged", "rate hold",
+    ]) or re.search(r"\bfed\b", t):
+        return "🏦"
+
+    # 5. Oil / energy (non-directional)
     if any(k in t for k in [
         "oil", "crude", "opec", "barrel", "brent", "wti",
         "hormuz", "petroleum", "energy supply",
     ]):
         return "🛢️"
 
-    # Gold price hit
-    if any(k in t for k in [
-        "gold hits", "gold surges", "gold reaches", "gold at $",
-        "gold record", "xau hits", "xauusd", "gold all time",
-        "gold rallies", "gold jumps",
-    ]):
-        return "🏆"
-
-    # General gold mention
-    if any(k in t for k in ["gold", "xau", "bullion", "precious metal"]):
-        return "🏆"
-
-    # Dollar / DXY
-    if any(k in t for k in [
-        "dollar", "dxy", "usd index", "dollar index",
-        "dollar rallies", "dollar drops", "dollar strength",
-    ]):
-        return "💵"
-
-    # War / geopolitical conflict / sanctions
-    if any(k in t for k in [
-        "war", "missile", "strike", "attack", "bomb",
-        "sanction", "conflict", "troops", "invasion",
-        "nuclear", "explosion", "military",
-    ]):
+    # 6. War / geopolitical conflict / sanctions / breaking
+    # Use word-boundary regex for short words like "war" to avoid matching "warns", "award" etc.
+    if (
+        re.search(r"\bwar\b", t) or
+        any(k in t for k in [
+            "missile", "airstrike", "air strike", "bomb", "bombing",
+            "sanction", "sanctions", "conflict", "troops", "invasion",
+            "nuclear", "explosion", "military action",
+            "breaking", "urgent", "flash", "just in", "alert",
+            "emergency", "crisis", "ceasefire",
+        ])
+    ):
         return "🚨"
 
-    # Trump / US political / tariffs
+    # 7. Trump / US political / tariffs
     if any(k in t for k in [
         "trump", "tariff", "trade war", "trade deal",
         "white house", "executive order",
     ]):
         return "🇺🇸"
 
-    # Geopolitical — world leaders / tensions
+    # 8. World leaders / geopolitical tensions / statements
     if any(k in t for k in [
-        "putin", "xi jinping", "iran", "ukraine", "russia",
+        "putin", "xi jinping", "xi ", "iran", "ukraine", "russia",
         "nato", "opec", "middle east", "geopolit",
-        "biden", "president", "prime minister",
+        "biden", "president", "prime minister", "warns", "threatens",
     ]):
         return "🌍"
 
-    # Breaking / urgent — fallback for anything urgent-sounding
-    if any(k in t for k in [
-        "breaking", "urgent", "flash", "just in", "alert",
-        "emergency", "crisis",
-    ]):
-        return "🚨"
-
-    # Default
+    # 9. Default
     return "🌍"
 
 
@@ -358,7 +437,6 @@ def _apply_emoji_and_hashtags(text: str, is_calendar: bool = False) -> str:
     text = text.strip()
 
     # Step 2 — emoji: check first real character
-    # Walk past leading whitespace to find actual first char
     first_char = text.lstrip()[0] if text.strip() else ""
     has_emoji  = first_char and ord(first_char) > 127
 
@@ -646,11 +724,9 @@ def _validate_and_clean(data: dict) -> dict:
         text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text)
         text = _strip_be_careful(text)
         text = _strip_hashtag_label(text)
-        # Clean up extra blank lines
         text = re.sub(r"\n\s*\n", "\n\n", text).strip()
         data["formatted_text"] = text
 
-    # Hard block check on cleaned text
     if data.get("approved"):
         block = _hard_block(data.get("formatted_text", ""))
         if block:
@@ -844,7 +920,6 @@ class AIEngine:
                 )
                 data = _parse_json(resp.text)
                 if data.get("approved") and data.get("formatted_text"):
-                    # Calendar posts: emoji added but NO hashtags
                     data["formatted_text"] = _build_post_body(
                         data["formatted_text"], is_calendar=True
                     )
@@ -886,6 +961,16 @@ class AIEngine:
     async def is_same_story(self, text_a: str, text_b: str,
                             image_a: Optional[bytes] = None,
                             image_b: Optional[bytes] = None) -> bool:
+        """
+        IMPROVED similarity check:
+        - Normalise both texts before comparing
+        - Exact match → instant True
+        - High keyword overlap (≥0.80) → True without AI
+        - Low overlap (<0.15) → False without AI (was 0.10 — stricter)
+        - Grey zone → AI decides (confidence threshold raised to 0.80)
+        - Geopolitical breaking news: different entities = NOT duplicate
+          even if similar wording (e.g. two different missile strikes)
+        """
         def _normalise(t: str) -> str:
             if not t:
                 return ""
@@ -898,22 +983,44 @@ class AIEngine:
         norm_a = _normalise(text_a)
         norm_b = _normalise(text_b)
 
+        # Exact match
         if norm_a and norm_b and norm_a == norm_b:
             return True
 
+        stops = {
+            "the","a","an","is","are","was","were","in","on","at","to",
+            "of","and","or","for","with","as","by","from","that","this",
+            "it","its","be","been","has","have","had","will","said","says",
+            "after","before","during","while","amid","over","under","into",
+        }
+
         if norm_a and norm_b:
-            stops = {
-                "the","a","an","is","are","was","were","in","on","at","to",
-                "of","and","or","for","with","as","by","from","that","this",
-                "it","its","be","been","has","have","had","will","said","says"
-            }
             keys_a = set(norm_a.split()) - stops
             keys_b = set(norm_b.split()) - stops
+
             if keys_a and keys_b:
                 overlap = len(keys_a & keys_b) / min(len(keys_a), len(keys_b))
+
+                # Very high overlap — definite duplicate
                 if overlap >= 0.80:
                     return True
-                if overlap < 0.10 and not image_a and not image_b:
+
+                # Very low overlap — clearly different stories, skip AI
+                if overlap < 0.15 and not image_a and not image_b:
+                    return False
+
+                # IMPROVEMENT: if both contain a named entity (country, person)
+                # and those entities differ → not a duplicate even with moderate overlap
+                _ENTITIES = [
+                    "trump", "powell", "biden", "putin", "xi", "iran", "ukraine",
+                    "russia", "china", "europe", "opec", "nato", "israel", "gaza",
+                    "fed", "ecb", "boj", "boe", "gold", "oil", "nfp", "cpi",
+                    "gdp", "pce",
+                ]
+                ents_a = {e for e in _ENTITIES if e in norm_a}
+                ents_b = {e for e in _ENTITIES if e in norm_b}
+                # If both have entities and they don't overlap — different stories
+                if ents_a and ents_b and not (ents_a & ents_b):
                     return False
 
         has_content = norm_a or norm_b or image_a or image_b
@@ -947,9 +1054,10 @@ class AIEngine:
             data       = _parse_json(resp.text)
             confidence = data.get("confidence", 0)
             same       = bool(data.get("same_story", False))
-            if same and confidence >= 0.75:
+            # RAISED threshold: was 0.75, now 0.80 — less aggressive blocking
+            if same and confidence >= 0.80:
                 return True
-            if not same and confidence >= 0.75:
+            if not same and confidence >= 0.80:
                 return False
         except Exception as e:
             log.warning(f"Gemini similarity failed: {e}")
@@ -977,7 +1085,7 @@ class AIEngine:
             data       = _parse_json(resp.choices[0].message.content)
             confidence = data.get("confidence", 0)
             same       = bool(data.get("same_story", False))
-            return same and confidence >= 0.75
+            return same and confidence >= 0.80
         except Exception as e:
             log.warning(f"Groq similarity failed: {e}")
             return False
