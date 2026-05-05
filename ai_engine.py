@@ -2,7 +2,7 @@
 ai_engine.py — AXIOM INTEL AI Engine.
 - Gemini primary, Groq fallback with retry.
 - Hard blocks: signals, sentiment, watermark, injection.
-- Hashtags: #XAUUSD #DXY #OIL only where relevant.
+- Hashtags: #XAUUSD #DXY #OIL only where relevant, no "HASHTAGS:" label.
 - FF calendar: daily once/day, weekly once/week.
 - Geopolitical/FOMC always approved.
 - Same-time events: comma-joined on ONE line.
@@ -48,6 +48,11 @@ def _add_us_flag(text: str) -> str:
 
 def _strip_be_careful(text: str) -> str:
     return re.sub(r"\n?Be careful[^\n]*\n?", "", text, flags=re.IGNORECASE).strip()
+
+
+def _strip_hashtag_label(text: str) -> str:
+    """Remove any 'HASHTAGS:' or 'HASHTAGS -' label the AI writes."""
+    return re.sub(r"HASHTAGS?\s*[:\-]?\s*\n?", "", text, flags=re.IGNORECASE).strip()
 
 
 # ── Hard block patterns ───────────────────────────────────────────────────────
@@ -130,13 +135,25 @@ FORMAT (approved posts only):
 
 [2-4 sentences. Real numbers allowed. No forecast. No previous.]
 
-HASHTAGS — add ALL that apply:
+ADD HASHTAGS INLINE — no label, no "HASHTAGS:" word, just the tags on their own line:
 - Affects Gold → #XAUUSD
 - Affects USD/Dollar → #DXY
 - Affects Oil → #OIL
 - FOMC/Fed → always #DXY #XAUUSD
 - Geopolitical/war → depends on impact
 - Never add any other hashtag
+
+CORRECT EXAMPLE:
+🚨 Iranian drones hit UAE vessel in Hormuz.
+
+The incident occurred in the Hormuz Strait, a critical oil waterway.
+Iran's involvement may trigger further sanctions or retaliation.
+
+#OIL #XAUUSD #DXY
+
+WRONG — never write the word HASHTAGS:
+HASHTAGS:
+#OIL #XAUUSD
 
 EMOJI: 🚨 🌍 📊 🏦 🛢️ 🏆 💵 ⚠️ 🗳️ 🇺🇸
 
@@ -316,6 +333,7 @@ def _validate_and_clean(data: dict) -> dict:
         text = text.replace("*", "")
         text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text)
         text = _strip_be_careful(text)
+        text = _strip_hashtag_label(text)
 
         # Calendar posts — strip ALL hashtags
         if text.startswith("TODAY'S USD") or text.startswith("WEEKLY HIGH IMPACT"):
@@ -359,6 +377,7 @@ def _build_post_body(text: str) -> str:
     text = text.replace("*", "")
     text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text)
     text = _strip_be_careful(text)
+    text = _strip_hashtag_label(text)
     # Remove 4-digit years from last 3 lines
     lines = text.split("\n")
     for i in range(max(0, len(lines) - 3), len(lines)):
