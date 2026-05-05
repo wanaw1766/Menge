@@ -1,11 +1,14 @@
 """
-ai_engine.py — AXIOM INTEL using Groq as the primary AI engine.
-- Gemini removed (quota exhausted).
-- Robust JSON parsing: handles comments, missing fields, alternative keys.
-- Preserves exact numbers, rejects TA charts.
+ai_engine.py — AXIOM INTEL AI Engine.
+- Gemini primary, Groq fallback with retry.
+- Hard blocks: signals, sentiment, watermark, injection.
+- Hashtags: #XAUUSD #DXY #OIL only where relevant.
+- FF calendar: daily once/day, weekly once/week.
+- Geopolitical/FOMC always approved.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import random
@@ -14,13 +17,16 @@ import textwrap
 from datetime import datetime, timezone
 from typing import Optional
 
+import google.generativeai as genai
 from groq import AsyncGroq
 
 log = logging.getLogger("ai_engine")
 
 CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
-ALLOWED_HASHTAGS_SET = {"#XAUUSD", "#DXY", "#OIL"}
+ALLOWED_HASHTAGS  = {"#XAUUSD", "#DXY", "#OIL"}
 
+
+# ── Signature ─────────────────────────────────────────────────────────────────
 def _add_signature(text: str) -> str:
     text = text.strip()
     if "[Squad 4xx]" not in text:
@@ -30,240 +36,267 @@ def _add_signature(text: str) -> str:
             text += "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
     return text
 
-def _add_us_flag_emoji(text: str) -> str:
+
+def _add_us_flag(text: str) -> str:
     if not text:
         return text
-    lines = text.split('\n')
-    if not lines:
-        return text
-    first_line = lines[0]
-    new_line = re.sub(r'\bUS\b', 'US 🇺🇸', first_line, count=1)
-    new_line = re.sub(r'\bUSD\b', 'USD 🇺🇸', new_line, count=1)
-    lines[0] = new_line
-    return '\n'.join(lines)
+    lines = text.split("\n")
+    lines[0] = re.sub(r"\bUSD\b", "USD 🇺🇸", lines[0], count=1)
+    return "\n".join(lines)
+
 
 def _strip_be_careful(text: str) -> str:
-    return re.sub(r'\n?Be careful[^\n]*\n?', '', text, flags=re.IGNORECASE).strip()
+    return re.sub(r"\n?Be careful[^\n]*\n?", "", text, flags=re.IGNORECASE).strip()
 
-def _get_be_careful_line(event_name: str) -> str:
-    n = event_name.lower()
-    if any(kw in n for kw in ["fomc", "federal funds", "interest rate", "fed chair", "powell", "federal reserve"]):
-        return "⚠️ Fed decisions move everything. Be careful — no new trades during the release."
-    if any(kw in n for kw in ["non-farm", "nfp", "payroll"]):
-        return "⚠️ NFP can spike the market violently. Be careful — protect your capital now."
-    if any(kw in n for kw in ["cpi", "consumer price", "inflation"]):
-        return "⚠️ Inflation data whipsaws fast. Be careful — secure profits before the release."
-    if any(kw in n for kw in ["pce", "core pce"]):
-        return "⚠️ PCE can shift rate expectations quickly. Be careful and protect your positions."
-    if "gdp" in n:
-        return "⚠️ GDP surprises hit hard and fast. Be careful — move stops to break-even now."
-    if any(kw in n for kw in ["unemployment rate", "jobless"]):
-        return "⚠️ Unemployment data moves USD sharply. Be careful — no new entries during release."
-    if any(kw in n for kw in ["retail sales"]):
-        return "⚠️ Retail Sales can jolt the market. Be careful — protect your open positions."
-    if any(kw in n for kw in ["ism manufacturing", "ism non-manufacturing", "ism services"]):
-        return "⚠️ ISM data can move USD fast. Be careful — stay out until the dust settles."
-    if any(kw in n for kw in ["employment cost", "eci"]):
-        return "⚠️ Employment Cost data affects rate outlook. Be careful and reduce your exposure."
-    if any(kw in n for kw in ["ppi", "producer price"]):
-        return "⚠️ PPI surprises can hit USD hard. Be careful — protect your capital."
-    if any(kw in n for kw in ["trade balance", "current account"]):
-        return "⚠️ Trade data can move USD unexpectedly. Be careful during the release."
-    if any(kw in n for kw in ["durable goods"]):
-        return "⚠️ Durable Goods can cause sharp moves. Be careful — no new entries now."
-    return "⚠️ This release can move the market strongly. Be careful — protect your capital."
 
+# ── Hard block patterns ───────────────────────────────────────────────────────
+_SIGNAL_RE = re.compile(
+    r"\b(buy|sell|long|short|entry|tp|take[\s_-]?profit|sl|"
+    r"stop[\s_-]?loss|stoploss|stop\s+at\s+\d|"
+    r"entry\s*[:\-]?\s*\d|target\s*[:\-]?\s*\d)\b",
+    re.IGNORECASE,
+)
+_SENTIMENT_RE = re.compile(
+    r"\b(fear\s*[&and]+\s*greed|greed\s*index|fear\s*index|"
+    r"sentiment\s*index|market\s*sentiment|investor\s*sentiment|"
+    r"bulls?\s*vs\.?\s*bears?|smart\s*money|dumb\s*money|"
+    r"cot\s*report|commitment\s*of\s*traders|"
+    r"put[/-]call\s*ratio|vix\s*index)\b",
+    re.IGNORECASE,
+)
+_WATERMARK_RE = re.compile(
+    r"(t\.me/(?!Squad_4xx)[a-zA-Z0-9_]+|"
+    r"@(?!Squad_4xx)[a-zA-Z0-9_]{4,})",
+    re.IGNORECASE,
+)
+_INJECTION_RE = re.compile(
+    r"\b(ignore\s+(all\s+|previous\s+)?rules?|"
+    r"ignore\s+(all\s+)?instructions?|system\s*prompt|"
+    r"override\s+rules?|jailbreak|act\s+as\s+|"
+    r"forget\s+instructions?|disregard\s+rules?)\b",
+    re.IGNORECASE,
+)
+
+
+def _hard_block(text: str) -> Optional[str]:
+    """Returns block reason or None if clean."""
+    if not text:
+        return None
+    if _SIGNAL_RE.search(text):
+        return "signal_content"
+    if _SENTIMENT_RE.search(text):
+        return "sentiment_content"
+    if _WATERMARK_RE.search(text):
+        return "watermark_content"
+    if _INJECTION_RE.search(text):
+        return "injection_attempt"
+    return None
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
 _SYSTEM_PROMPT = """
-You are AXIOM INTEL — a Senior Institutional Macro & Geopolitical news editor.
+You are AXIOM INTEL — Senior Institutional Macro & Geopolitical news editor.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔥 GEOPOLITICAL EXCEPTION (ALWAYS APPROVE)
+ALWAYS APPROVE — NO EXCEPTIONS:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Any statement from a world leader (e.g., Trump, Biden, Putin, Xi) that affects:
-- Oil supply (Hormuz, OPEC, embargo, sanctions)
-- War / conflict escalation
-- Tariffs / trade restrictions
-- Central bank or financial policy changes
-- Gold, USD, or energy markets
-These are HIGH IMPACT geopolitical events, even if posted on social media.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔥 FOMC / CENTRAL BANK EXCEPTION (ALWAYS APPROVE)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Any official announcement or news about:
-- Federal Open Market Committee (FOMC)
-- Federal Funds Rate / Interest Rate Decision
-- Fed Chair Powell speech
-- FOMC Statement or Minutes
-These are HIGH IMPACT macroeconomic events. Always approve even if they contain numbers like "rate at 5.25%". Do NOT reject as "forecast" or "commentary".
+1. FOMC / Fed decisions — rate held, cut, raised (any bps)
+2. Fed Chair Powell speaking
+3. Any world leader statement affecting: Oil, Gold, USD, tariffs, war, sanctions
+   (Trump, Biden, Putin, Xi, Iran, OPEC, NATO)
+4. Geopolitical events: war, missile, strike, sanctions, Hormuz, Ukraine
+5. Actual released economic data with real numbers:
+   "CPI came at 2.8%", "NFP 250K", "GDP rose 2.1%", "raised by 25bps"
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-YOUR ONLY JOB:
-Take the source content, clean it, and format it cleanly.
-Do NOT change the meaning. Do NOT rewrite headlines. Do NOT alter numbers, prices, percentages, or dollar amounts.
-Do NOT speculate. Do NOT add analysis beyond the facts.
-
-CRITICAL FORMATTING RULES:
-- DO NOT use asterisks (*) or any markdown bolding.
-- Use ONLY plain text and emojis.
-- NO NOTE line. NO MARKET STATUS. NO commentary line.
-- **PRESERVE EXACT NUMBERS, PRICES, PERCENTAGES, AND DOLLAR AMOUNTS** – copy them exactly as they appear.
-- **DO NOT summarise or paraphrase** – keep the original wording as close as possible.
-- Actual released figures (e.g., "came at 2.5%") are ALLOWED and must be copied exactly.
-- Forecast (expected) and previous values are FORBIDDEN. Never include them.
-- Technical analysis, signals, predictions, opinions are FORBIDDEN.
-- Hashtags: Only use #XAUUSD, #DXY, or #OIL – only those relevant to the story.
-  - For gold (XAU) → #XAUUSD
-  - For USD strength/weakness → #DXY
-  - For crude oil/WTI/Brent → #OIL
-- Do NOT add the current year at the end of posts.
-- Do NOT add signature (added automatically).
+ALWAYS REJECT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Signals — Buy/Sell/Long/Short/Entry/TP/SL
+2. Technical analysis — patterns, indicators, charts
+3. Memes, jokes, informal content
+4. Chart screenshots, TA images
+5. Another channel watermark or username
+6. Content older than 18 hours
+7. Forecast/Previous values — "forecast 180K", "previous 2.3%"
+8. Opinions — "I think", "expect", "my analysis"
+9. Sentiment — Fear & Greed, COT, smart money, VIX
+10. Bank sentiment — "banks are bullish/bearish"
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-REJECT IF ANY OF THESE APPLY:
-1. SIGNALS       — Buy/Sell/Long/Short/Entry/TP/SL/price targets
-2. CHART / TA    — Technical analysis, patterns, indicators
-3. MEME          — Memes, jokes, informal content
-4. ANALYSIS IMG  — Chart screenshots with TA annotations (drawn lines, arrows, circles, RSI, MACD)
-5. WATERMARK     — Another channel logo or username
-6. STALE         — Content older than 18 hours
-7. OFF-TOPIC     — Not about geopolitics, central banks, macro data, Gold, Oil, USD
-8. LOW VALUE     — Vague, no specific real-world event
-9. DUPLICATE     — Same story already processed
-10. PREDICTION   — "I think", "expect", "my analysis", forecasts
-11. COMMENTARY   — Personal views, market opinions
-12. FORECAST/PREVIOUS — Any mention of "forecast", "expected", "previous" values
-13. TA CHART WITH MARKINGS — Any image containing drawn lines, arrows, circles, text annotations, RSI, MACD, or indicator overlay.
-
+FORMAT (approved posts only):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FORMAT (if approved):
-[EMOJI] [SHORT ENGLISH HEADLINE — one line, factual, preserving original numbers]
+[EMOJI] [SHORT FACTUAL HEADLINE]
 
-[Source content lightly cleaned. 2-4 sentences max. Keep exact prices/data.]
+[2-4 sentences. Real numbers allowed. No forecast. No previous.]
 
-[Relevant hashtags: #XAUUSD #DXY #OIL — only those that apply]
+HASHTAGS — add ALL that apply:
+- Affects Gold → #XAUUSD
+- Affects USD/Dollar → #DXY
+- Affects Oil → #OIL
+- FOMC/Fed → always #DXY #XAUUSD
+- Geopolitical/war → depends on impact
+- Never add any other hashtag
 
 EMOJI: 🚨 🌍 📊 🏦 🛢️ 🏆 💵 ⚠️ 🗳️
 
-RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS.
-"""
+DO NOT add signature. DO NOT add year. NO asterisks. NO bold.
 
-_SIMILARITY_PROMPT = """
-You are a duplicate news detector. Compare the two stories. If they describe the same real-world event – even if worded differently – respond with same_story=true.
-Be aggressive. If any chance they are the same, mark true.
+RESPOND WITH VALID JSON ONLY:
+{"approved": true/false, "reason": "...", "issues": [], "formatted_text": "...", "confidence": 0.9}
+""".strip()
 
-Story A: {story_a}
-Story B: {story_b}
 
-Respond in JSON: {{"same_story": true/false, "confidence": 0.0-1.0, "reason": "..."}}
-"""
-
-_MULTIMODAL_SIMILARITY_PROMPT = """
-You are a duplicate news detector. Compare the two items (text + optional images). Decide if they are the SAME real-world event.
-
-Item A text: {text_a}
-Item B text: {text_b}
-(Images compared visually if both exist)
-
-Be aggressive: if any chance they are the same, mark same_story=true.
-
-Respond in JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
-"""
-
-_FF_IMAGE_PROMPT = """
+# ── ForexFactory prompts ──────────────────────────────────────────────────────
+_FF_DAILY_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
-EXPECTED DATE: {today_date} (example: "Friday, May 1" — no year).
-The screenshot may show the same date with or without the year. Ignore the year.
-Only approve if the date matches (day and month), regardless of year.
+TODAY'S DATE: {today_date}
 
-INSTRUCTIONS:
-1. Check date in screenshot — must match {today_date} (year optional). If not → reject.
-2. Extract ALL USD high-impact (🔴) and medium-impact (🟠) events.
-   Write EACH event on its OWN separate line — even if same time.
-3. Do NOT include the year in the date line (e.g. "Thursday, April 30").
-4. Do NOT add any hashtags.
-5. No forecast, no previous data, no NOTE, no commentary.
-6. Do NOT add "Be careful" line — added automatically.
-7. Keep original times. Convert to 12-hour AM/PM. No timezone. No leading zero.
+TASK:
+1. Verify the calendar shows TODAY: {today_date}
+   If different date → {{"approved": false, "reason": "wrong date"}}
 
-EXACT OUTPUT FORMAT:
+2. Extract ALL USD 🔴 (high impact) and 🟠 (medium impact) events.
+   Write EACH event on its OWN line — even if same time.
 
+3. Format rules:
+   - Time: 12-hour AM/PM only, NO leading zero (3:30 PM not 03:30 PM)
+   - NO year in date line
+   - NO forecast, NO previous values
+   - NO hashtags
+   - NO "Be careful" line
+   - NO signature
+   - Plain text only
+
+EXACT FORMAT:
 TODAY'S USD HIGH IMPACT NEWS
 Thursday, April 30
 
 🔴 3:30 PM | USD: Advance GDP q/q
 🔴 3:30 PM | USD: Core PCE Price Index m/m
-🔴 3:30 PM | USD: Employment Cost Index q/q
 🟠 5:00 PM | USD: Unemployment Claims
 
-RULES:
-- Only USD events (🔴 and 🟠 only)
-- Each event on its own line
-- 12-hour AM/PM, no leading zero
-- Plain text — no asterisks, no bold
-- No signature or "Be careful" line
+If valid → {{"approved": true, "reason": "valid daily FF", "formatted_text": "..."}}
+If invalid → {{"approved": false, "reason": "..."}}
+RESPOND WITH VALID JSON ONLY.
+""".strip()
 
-If not valid FF calendar for today: {"approved": false, "reason": "not valid FF today image"}
-If valid: {"approved": true, "reason": "valid FF today image", "formatted_text": "..."}
-"""
+_FF_WEEKLY_PROMPT = """
+You are analysing a ForexFactory weekly calendar screenshot.
 
-_FF_WEEKLY_IMAGE_PROMPT = """
-You are analysing a ForexFactory calendar for the weekly outlook.
-The image MUST show a date range (e.g., "Week of May 4 – May 11") or multiple day headers.
-If only a single date appears, reject as not weekly.
+CURRENT WEEK: {week_range}
 
-INSTRUCTIONS:
-- Identify the week range (e.g., "May 4 – May 10").
-- Extract ALL USD high-impact (🔴) and medium-impact (🟠) events for the entire week.
-- Group events by day. Write "Monday — May 4" (no year).
-- Each event on its own line under the day.
-- Use 12-hour AM/PM, no leading zero.
-- No forecast, previous data, hashtags.
-- Do NOT add "Be careful" line.
+TASK:
+1. Confirm this shows MULTIPLE DAYS (weekly view).
+   If only one day → {{"approved": false, "reason": "not weekly"}}
 
-Output example:
+2. Extract ALL USD 🔴 and 🟠 events grouped by day.
+   Each event on its OWN line.
+
+3. Format rules:
+   - Time: 12-hour AM/PM, NO leading zero (3:30 PM not 03:30 PM)
+   - NO year in dates
+   - NO forecast, NO previous
+   - NO hashtags
+   - NO "Be careful" line
+   - NO signature
+   - Plain text only
+
+EXACT FORMAT:
 WEEKLY HIGH IMPACT NEWS
-Week of May 4 – May 8, 2026
+Week of May 5 – May 9
 
-Monday — May 4
-🔴 3:30 PM | USD: ISM Manufacturing PMI
+Monday — May 5
+🟠 5:00 PM | USD: ISM Services PMI
 
-Tuesday — May 5
-🟠 10:00 AM | USD: JOLTS Job Openings
+Wednesday — May 7
+🔴 3:30 PM | USD: CPI m/m
+🔴 3:30 PM | USD: Core CPI m/m
 
-If not a weekly calendar: {"approved": false, "reason": "not a weekly calendar (single date)"}
-If valid: {"approved": true, "reason": "valid weekly calendar", "formatted_text": "..."}
+If valid → {{"approved": true, "reason": "valid weekly FF", "formatted_text": "..."}}
+If invalid → {{"approved": false, "reason": "..."}}
+RESPOND WITH VALID JSON ONLY.
+""".strip()
+
+_FF_DETECT_PROMPT = """
+Look at this image carefully and answer:
+1. Is this a ForexFactory.com economic calendar screenshot?
+2. Does it show MULTIPLE DAYS (weekly) or ONE day (daily)?
+
+Weekly = shows Monday/Tuesday/Wednesday etc or multiple dates.
+Daily = shows only one date.
+
+Respond ONLY with JSON:
+{"is_ff": true/false, "is_weekly": true/false}
 """
+
+_SIMILARITY_PROMPT = """
+Compare these two news stories. Are they about the same real-world event?
+Even if worded differently or from different sources.
+
+Story A: {story_a}
+Story B: {story_b}
+
+Be aggressive — if any reasonable chance they are same, mark true.
+JSON: {{"same_story": true/false, "confidence": 0.0-1.0, "reason": "..."}}
+"""
+
+
+# ── Be-careful lines for reminders ────────────────────────────────────────────
+def _get_be_careful_line(event_name: str) -> str:
+    n = event_name.lower()
+    if any(k in n for k in ["fomc", "federal funds", "interest rate", "fed chair", "powell"]):
+        return "⚠️ Fed decisions move everything. Be careful — no new trades during the release."
+    if any(k in n for k in ["non-farm", "nfp", "payroll"]):
+        return "⚠️ NFP can spike the market violently. Be careful — protect your capital now."
+    if any(k in n for k in ["cpi", "consumer price", "inflation"]):
+        return "⚠️ Inflation data whipsaws fast. Be careful — secure profits before the release."
+    if any(k in n for k in ["pce", "core pce"]):
+        return "⚠️ PCE can shift rate expectations quickly. Be careful — protect your positions."
+    if "gdp" in n:
+        return "⚠️ GDP surprises hit hard and fast. Be careful — move stops to break-even now."
+    if any(k in n for k in ["unemployment", "jobless"]):
+        return "⚠️ Unemployment data moves USD sharply. Be careful — no new entries."
+    if "retail sales" in n:
+        return "⚠️ Retail Sales can jolt the market. Be careful — protect your open positions."
+    if any(k in n for k in ["ism", "pmi"]):
+        return "⚠️ ISM data can move USD fast. Be careful — wait for the dust to settle."
+    if any(k in n for k in ["ppi", "producer price"]):
+        return "⚠️ PPI surprises can hit USD hard. Be careful — protect your capital."
+    if "durable goods" in n:
+        return "⚠️ Durable Goods can cause sharp moves. Be careful — no new entries now."
+    return "⚠️ This release can move the market strongly. Be careful — protect your capital."
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
+
 
 def _today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-def _repair_json(raw: str) -> dict:
-    """Aggressively repair Groq's malformed JSON."""
-    # Remove markdown fences
+
+# ── JSON parsing ──────────────────────────────────────────────────────────────
+def _parse_json(raw: str) -> dict:
+    if not raw:
+        raise ValueError("Empty AI response")
     raw = re.sub(r"```+(?:json|JSON)?", "", raw)
-    raw = re.sub(r"```+", "", raw)
-    # Remove comments (// ...)
-    raw = re.sub(r'//.*?(\n|$)', '\n', raw)
-    # Remove trailing commas
-    raw = re.sub(r',\s*([}\]])', r'\1', raw)
-    # Extract first JSON object
-    m = re.search(r'\{.*\}', raw, re.DOTALL)
-    if not m:
-        raise ValueError("No JSON object found")
-    candidate = m.group()
+    raw = re.sub(r"```+", "", raw).strip().strip("`").strip()
+    raw = re.sub(r",\s*([}\]])", r"\1", raw)
     try:
-        data = json.loads(candidate)
-    except json.JSONDecodeError as e:
-        # If still fails, try to replace single quotes with double quotes
-        candidate = re.sub(r"'([^']*)':", r'"\1":', candidate)
-        candidate = re.sub(r": '([^']*)'", r': "\1"', candidate)
-        data = json.loads(candidate)
-    # Normalise keys: if "content" exists but not "formatted_text", map it
-    if "content" in data and "formatted_text" not in data:
-        data["formatted_text"] = data.pop("content")
-    return data
+        return _validate_and_clean(json.loads(raw))
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        try:
+            return _validate_and_clean(json.loads(
+                re.sub(r",\s*([}\]])", r"\1", m.group())
+            ))
+        except json.JSONDecodeError:
+            pass
+    raise ValueError(f"No valid JSON in AI response: {raw[:200]}")
+
 
 def _validate_and_clean(data: dict) -> dict:
     data.setdefault("approved", False)
@@ -273,151 +306,325 @@ def _validate_and_clean(data: dict) -> dict:
     data.setdefault("confidence", 0.5)
 
     if data.get("formatted_text"):
-        data["formatted_text"] = data["formatted_text"].replace("*", "")
-        data["formatted_text"] = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", data["formatted_text"]).strip()
-        data["formatted_text"] = _strip_be_careful(data["formatted_text"])
         text = data["formatted_text"]
-        if "TODAY'S USD HIGH IMPACT" in text or "WEEKLY HIGH IMPACT" in text:
+        text = text.replace("*", "")
+        text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text)
+        text = _strip_be_careful(text)
+
+        # Calendar posts — strip ALL hashtags
+        if text.startswith("TODAY'S USD") or text.startswith("WEEKLY HIGH IMPACT"):
             text = re.sub(r"#\w+", "", text).strip()
-            data["formatted_text"] = text
         else:
-            hashtags = re.findall(r"#\w+", text)
-            allowed = [h for h in hashtags if h in ALLOWED_HASHTAGS_SET]
-            text = re.sub(r"#\w+", "", text).strip()
-            if re.search(r'\bgold\b|\bxau\b', text, re.IGNORECASE) and "#XAUUSD" not in allowed:
-                allowed.append("#XAUUSD")
-            if re.search(r'\boil\b|\bwti\b|\bbrent\b', text, re.IGNORECASE) and "#OIL" not in allowed:
-                allowed.append("#OIL")
-            if re.search(r'\bdxy\b|\busd\b', text, re.IGNORECASE) and "#DXY" not in allowed:
-                allowed.append("#DXY")
+            # Regular news — keep only allowed hashtags
+            found    = re.findall(r"#\w+", text)
+            allowed  = [h for h in found if h in ALLOWED_HASHTAGS]
+            text     = re.sub(r"#\w+", "", text).strip()
             if allowed:
-                text = text + "\n\n" + " ".join(allowed)
-            data["formatted_text"] = text
+                text = text.rstrip() + "\n\n" + " ".join(allowed)
+
+        data["formatted_text"] = text
+
+    # Hard blocks — post-AI check
+    if data.get("approved"):
+        block = _hard_block(data.get("formatted_text", ""))
+        if block:
+            data["approved"]       = False
+            data["reason"]         = f"Hard blocked: {block}"
+            data["issues"].append(block)
+            data["formatted_text"] = ""
+
     return data
 
-class AIEngine:
-    def __init__(self, gemini_key: str, groq_key: str, channel_category: str):
-        # Gemini key ignored (kept for compatibility)
-        self._groq = AsyncGroq(api_key=groq_key)
-        self._category = channel_category
 
-    async def analyse(self, text: str, image_data: Optional[bytes] = None,
-                      image_mime: str = "image/jpeg") -> dict:
-        prompt = self._build_moderation_prompt(text)
-        try:
-            verdict = await self._groq_call(prompt, image_data, image_mime)
-            verdict["engine"] = "groq-llama4-scout"
-            log.info(f"Groq → approved={verdict['approved']} | {verdict.get('reason','')}")
-            if verdict.get("approved") and verdict.get("formatted_text"):
-                verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
-                if not verdict["formatted_text"].startswith("TODAY'S USD HIGH IMPACT"):
-                    verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
-            return verdict
-        except Exception as e:
-            log.error(f"Groq analyse failed: {e}")
-            return {"approved": False, "reason": f"AI error: {e}", "issues": ["engine_error"], "formatted_text": "", "confidence": 0.0}
+def _reject(reason: str, issue: str, confidence: float = 1.0) -> dict:
+    return {
+        "approved":       False,
+        "reason":         reason,
+        "issues":         [issue],
+        "formatted_text": "",
+        "confidence":     confidence,
+        "engine":         "pre_filter",
+    }
 
-    async def is_same_story(self, text_a: str, text_b: str,
-                            image_a: Optional[bytes] = None,
-                            image_b: Optional[bytes] = None) -> bool:
-        if not text_a and not text_b and not image_a and not image_b:
-            return False
-        if image_a or image_b:
-            prompt = _MULTIMODAL_SIMILARITY_PROMPT.format(
-                text_a=(text_a[:400] if text_a else "(no text)"),
-                text_b=(text_b[:400] if text_b else "(no text)"),
-            )
-        else:
-            prompt = _SIMILARITY_PROMPT.format(
-                story_a=(text_a[:500] if text_a else ""),
-                story_b=(text_b[:500] if text_b else ""),
-            )
-        try:
-            content = []
-            if image_a:
-                content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{self._b64(image_a)}"}})
-            if image_b:
-                content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{self._b64(image_b)}"}})
-            content.append({"type": "text", "text": prompt})
-            resp = await self._groq.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[{"role": "user", "content": content}],
-                temperature=0.1, max_tokens=300,
-            )
-            data = _repair_json(resp.choices[0].message.content)
-            same = bool(data.get("same_story", False))
-            conf = data.get("confidence", 0)
-            log.info(f"Similarity → same={same} | conf={conf}")
-            return same and conf >= 0.55
-        except Exception as e:
-            log.error(f"Similarity error: {e}")
-            return False
-
-    async def analyse_ff_image(self, image_data: bytes, image_mime: str, today_date: str,
-                               is_weekly: bool = False, week_range: str = "") -> dict:
-        if is_weekly:
-            prompt = _FF_WEEKLY_IMAGE_PROMPT.format(week_range=week_range or "Week of ...")
-        else:
-            prompt = _FF_IMAGE_PROMPT.format(today_date=today_date)
-        try:
-            content = [
-                {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{self._b64(image_data)}"}},
-                {"type": "text", "text": prompt},
-            ]
-            resp = await self._groq.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[{"role": "user", "content": content}],
-                temperature=0.1, max_tokens=800,
-            )
-            data = _repair_json(resp.choices[0].message.content)
-            log.info(f"FF image → approved={data.get('approved')} | {data.get('reason','')}")
-            if data.get("approved") and data.get("formatted_text"):
-                data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
-            return data
-        except Exception as e:
-            log.error(f"FF image analysis failed: {e}")
-            return {"approved": False, "reason": f"AI error: {e}"}
-
-    async def get_be_careful_line(self, event_name: str) -> str:
-        return _get_be_careful_line(event_name)
-
-    def _build_moderation_prompt(self, text: str) -> str:
-        return textwrap.dedent(f"""
-            DATE (UTC): {_today_str()}
-            CHANNEL FOCUS: {self._category}
-            SOURCE CONTENT:
-            \"\"\"
-            {text.strip() if text else "(image only — no text)"}
-            \"\"\"
-            TASK: Analyse content. If relevant geopolitical/macro news OR actual released economic data, approve and format.
-            If forecast/previous values, signal, TA, meme, off-topic, stale — reject.
-            Format according to rules. Return JSON.
-        """).strip()
-
-    async def _groq_call(self, prompt: str, image_data: Optional[bytes], image_mime: str) -> dict:
-        content = []
-        if image_data:
-            content.append({"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{self._b64(image_data)}"}})
-        content.append({"type": "text", "text": prompt})
-        resp = await self._groq.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": content}],
-            temperature=0.15, max_tokens=600,
-        )
-        return _repair_json(resp.choices[0].message.content)
-
-    @staticmethod
-    def _b64(data: bytes) -> str:
-        import base64
-        return base64.b64encode(data).decode()
 
 def _build_post_body(text: str) -> str:
     if not text:
         return ""
     text = text.replace("*", "")
-    text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text).strip()
+    text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text)
     text = _strip_be_careful(text)
-    text = re.sub(r'\b\d{4}\b', '', text)
-    text = re.sub(r'\n\s*\n', '\n\n', text).strip()
-    text = _add_signature(text)
-    return text
+    # Remove 4-digit years from last 3 lines
+    lines = text.split("\n")
+    for i in range(max(0, len(lines) - 3), len(lines)):
+        lines[i] = re.sub(r"\b\d{4}\b", "", lines[i])
+    text = "\n".join(lines)
+    text = re.sub(r"\n\s*\n", "\n\n", text).strip()
+    return _add_signature(text)
+
+
+# ── AIEngine class ────────────────────────────────────────────────────────────
+class AIEngine:
+    def __init__(self, gemini_key: str, groq_key: str, channel_category: str):
+        self._category = channel_category
+        self._groq = AsyncGroq(api_key=groq_key)
+        genai.configure(api_key=gemini_key)
+
+        self._gemini = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            system_instruction=_SYSTEM_PROMPT,
+            generation_config=genai.GenerationConfig(
+                temperature=0.15, max_output_tokens=600,
+                response_mime_type="application/json"
+            ),
+        )
+        self._gemini_text = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            generation_config=genai.GenerationConfig(
+                temperature=0.2, max_output_tokens=1200
+            ),
+        )
+        # No response_mime_type on vision — causes conflicts with image prompts
+        self._gemini_vision = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            generation_config=genai.GenerationConfig(
+                temperature=0.1, max_output_tokens=1000
+            ),
+        )
+
+    # ── Main analyse ──────────────────────────────────────────────────────────
+
+    async def analyse(self, text: str, image_data: Optional[bytes] = None,
+                      image_mime: str = "image/jpeg") -> dict:
+
+        # Pre-filter source text before AI — saves quota
+        if text:
+            if _SENTIMENT_RE.search(text):
+                return _reject("Sentiment indicator blocked", "sentiment_content")
+            if _INJECTION_RE.search(text):
+                return _reject("Prompt injection blocked", "injection_attempt")
+            if _WATERMARK_RE.search(text):
+                return _reject("Watermark blocked", "watermark_content")
+
+        prompt = textwrap.dedent(f"""
+            DATE (UTC): {_today_str()}
+            CHANNEL FOCUS: {self._category}
+            SOURCE CONTENT:
+            \"\"\"
+            {text.strip() if text else "(image only)"}
+            \"\"\"
+            Analyse. If real geopolitical/macro news OR actual released data → approve and format.
+            If forecast/previous/signal/TA/meme/sentiment/stale → reject.
+            Return JSON.
+        """).strip()
+
+        # Try Gemini with one retry
+        for attempt in range(2):
+            try:
+                verdict = await asyncio.wait_for(
+                    self._gemini_call(prompt, image_data, image_mime), timeout=40
+                )
+                verdict["engine"] = "gemini-2.5-flash"
+                if verdict.get("approved") and verdict.get("formatted_text"):
+                    verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
+                    if not verdict["formatted_text"].startswith("TODAY'S USD"):
+                        verdict["formatted_text"] = _add_us_flag(verdict["formatted_text"])
+                return verdict
+            except asyncio.TimeoutError:
+                if attempt == 0:
+                    await asyncio.sleep(3)
+                    continue
+                break
+            except Exception:
+                break
+
+        # Groq fallback
+        try:
+            verdict = await asyncio.wait_for(
+                self._groq_call(prompt, image_data, image_mime), timeout=55
+            )
+            verdict["engine"] = "groq-llama4-scout"
+            if verdict.get("approved") and verdict.get("formatted_text"):
+                verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
+                if not verdict["formatted_text"].startswith("TODAY'S USD"):
+                    verdict["formatted_text"] = _add_us_flag(verdict["formatted_text"])
+            return verdict
+        except Exception:
+            return _reject("Both AI engines unavailable", "engine_error", confidence=0.0)
+
+    # ── FF image detection ────────────────────────────────────────────────────
+
+    async def detect_ff_image(self, image_data: bytes, image_mime: str) -> tuple:
+        """
+        Returns (is_ff: bool, is_weekly: bool).
+        Single AI call — detects both FF calendar and weekly/daily.
+        """
+        try:
+            parts = [
+                {"inline_data": {"mime_type": image_mime, "data": _b64(image_data)}},
+                _FF_DETECT_PROMPT,
+            ]
+            loop = asyncio.get_running_loop()
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: self._gemini_vision.generate_content(parts)
+                ),
+                timeout=30
+            )
+            raw  = re.sub(r"```+(?:json)?", "", resp.text).strip()
+            data = json.loads(raw)
+            return bool(data.get("is_ff", False)), bool(data.get("is_weekly", False))
+        except Exception:
+            return False, False
+
+    # ── FF image analysis ─────────────────────────────────────────────────────
+
+    async def analyse_ff_image(self, image_data: bytes, image_mime: str,
+                               today_date: str, is_weekly: bool = False,
+                               week_range: str = "") -> dict:
+        prompt = (
+            _FF_WEEKLY_PROMPT.format(week_range=week_range)
+            if is_weekly else
+            _FF_DAILY_PROMPT.format(today_date=today_date)
+        )
+        parts = [
+            {"inline_data": {"mime_type": image_mime, "data": _b64(image_data)}},
+            prompt,
+        ]
+
+        # Gemini with retry
+        for attempt in range(2):
+            try:
+                loop = asyncio.get_running_loop()
+                resp = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, lambda: self._gemini_vision.generate_content(parts)
+                    ),
+                    timeout=90
+                )
+                data = _parse_json(resp.text)
+                if data.get("approved") and data.get("formatted_text"):
+                    data["formatted_text"] = _add_us_flag(data["formatted_text"])
+                return data
+            except asyncio.TimeoutError:
+                if attempt == 0:
+                    await asyncio.sleep(3)
+                    continue
+                break
+            except Exception:
+                break
+
+        # Groq fallback
+        try:
+            content = [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}},
+                {"type": "text", "text": prompt},
+            ]
+            resp = await asyncio.wait_for(
+                self._groq.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    messages=[{"role": "user", "content": content}],
+                    temperature=0.1, max_tokens=800,
+                ),
+                timeout=90,
+            )
+            data = _parse_json(resp.choices[0].message.content)
+            if data.get("approved") and data.get("formatted_text"):
+                data["formatted_text"] = _add_us_flag(data["formatted_text"])
+            return data
+        except Exception:
+            return {"approved": False, "reason": "AI engines unavailable for image analysis."}
+
+    # ── Similarity check ──────────────────────────────────────────────────────
+
+    async def is_same_story(self, text_a: str, text_b: str,
+                            image_a: Optional[bytes] = None,
+                            image_b: Optional[bytes] = None) -> bool:
+        if not text_a and not text_b:
+            return False
+        prompt = _SIMILARITY_PROMPT.format(
+            story_a=(text_a[:500] if text_a else ""),
+            story_b=(text_b[:500] if text_b else ""),
+        )
+        try:
+            parts = []
+            if image_a:
+                parts.append({"inline_data": {"mime_type": "image/jpeg", "data": _b64(image_a)}})
+            parts.append(prompt)
+            loop = asyncio.get_running_loop()
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: self._gemini_vision.generate_content(parts)
+                ),
+                timeout=20
+            )
+            data = _parse_json(resp.text)
+            return bool(data.get("same_story", False)) and data.get("confidence", 0) >= 0.55
+        except Exception:
+            pass
+        try:
+            resp = await asyncio.wait_for(
+                self._groq.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1, max_tokens=300,
+                ),
+                timeout=25,
+            )
+            data = _parse_json(resp.choices[0].message.content)
+            return bool(data.get("same_story", False)) and data.get("confidence", 0) >= 0.55
+        except Exception:
+            return False
+
+    async def get_be_careful_line(self, event_name: str) -> str:
+        return _get_be_careful_line(event_name)
+
+    # ── Internal calls ────────────────────────────────────────────────────────
+
+    async def _gemini_call(self, prompt: str, image_data: Optional[bytes],
+                           image_mime: str) -> dict:
+        parts = []
+        if image_data:
+            parts.append({"inline_data": {"mime_type": image_mime, "data": _b64(image_data)}})
+        parts.append(prompt)
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(
+            None, lambda: self._gemini.generate_content(parts)
+        )
+        return _parse_json(resp.text)
+
+    async def _groq_call(self, prompt: str, image_data: Optional[bytes],
+                         image_mime: str) -> dict:
+        content = []
+        if image_data:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}
+            })
+        content.append({"type": "text", "text": prompt})
+        resp = await self._groq.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user",   "content": content},
+            ],
+            temperature=0.15, max_tokens=600,
+        )
+        return _parse_json(resp.choices[0].message.content)
+
+    @staticmethod
+    def _fallback_alert(event: dict, minutes_left: int) -> str:
+        emoji      = "🔴" if event.get("impact") == "red" else "🟠"
+        event_name = event.get("name", "Unknown Event")
+        line       = _get_be_careful_line(event_name)
+        text = (
+            f"🚨 ALERT: {minutes_left} MINUTES REMAINING\n\n"
+            f"{emoji} {event_name}\n"
+            f"🕒 {event.get('time_12h', '—')}\n\n"
+            f"REQUIRED ACTION:\n"
+            f"✅ Secure open profits now\n"
+            f"✅ Move Stop-Loss to Break-even\n"
+            f"✅ No new entries during the release\n\n"
+            f"{line}"
+        )
+        return _add_signature(_add_us_flag(text))
