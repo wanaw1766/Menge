@@ -8,6 +8,7 @@ scraper.py — AXIOM INTEL channel scraper and forwarder.
 - Time: 12h AM/PM no leading zero (3:30 PM not 03:30 PM)
 - All duplicate locks BEFORE AI call
 - Silent logging
+- AI calls protected by semaphore + similarity capped at 3
 """
 
 import asyncio
@@ -111,7 +112,6 @@ def _eat_today_str() -> str:
 
 
 def _eat_today_display() -> str:
-    # No leading zero on day — matches FF image "Fri May 1" not "Fri May 01"
     return _eat_now().strftime("%A, %B %-d, %Y")
 
 
@@ -147,6 +147,23 @@ def _normalise_urls(text: str) -> str:
     )
 
 
+def _text_similarity_ratio(a: str, b: str) -> float:
+    """
+    Fast token-overlap ratio — zero AI cost.
+    Returns 0.0 (no overlap) to 1.0 (identical).
+    Used to skip AI is_same_story when texts are obviously different.
+    """
+    if not a or not b:
+        return 0.0
+    tokens_a = set(re.findall(r'\b\w{4,}\b', a.lower()))
+    tokens_b = set(re.findall(r'\b\w{4,}\b', b.lower()))
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = tokens_a & tokens_b
+    union        = tokens_a | tokens_b
+    return len(intersection) / len(union)
+
+
 def _extract_events(text: str) -> List[dict]:
     """
     Parse AI output line by line, group same-time events.
@@ -166,7 +183,7 @@ def _extract_events(text: str) -> List[dict]:
             try:
                 dt       = datetime.strptime(time_str, fmt)
                 time_24h = dt.strftime("%H:%M")
-                time_12h = dt.strftime("%-I:%M %p")  # "3:30 PM" not "03:30 PM"
+                time_12h = dt.strftime("%-I:%M %p")
                 break
             except ValueError:
                 continue
@@ -220,6 +237,9 @@ class ChannelScraper:
         self._ai  = ai_engine
         self._mem = memory
 
+        # ── Groq quota guard — max 2 AI calls running at the same time ────────
+        self._ai_sem = asyncio.Semaphore(2)
+
         self._dest_channels: List[str] = config.get("dest_channels", [])
         if not self._dest_channels:
             single = config.get("dest_channel", "")
@@ -240,6 +260,39 @@ class ChannelScraper:
             else config.get("session_name", "manager_session")
         )
         self._client = TelegramClient(session, config["api_id"], config["api_hash"])
+
+    # ── Safe AI wrappers (all quota-protected) ────────────────────────────────
+
+    async def _ai_detect_ff(self, image_data: bytes, image_mime: str):
+        async with self._ai_sem:
+            return await self._ai.detect_ff_image(image_data, image_mime)
+
+    async def _ai_analyse(self, text: str, image_data, image_mime: str):
+        async with self._ai_sem:
+            return await self._ai.analyse(text, image_data, image_mime)
+
+    async def _ai_analyse_ff(self, image_data: bytes, image_mime: str,
+                             today_date: str, is_weekly: bool,
+                             week_range: str = ""):
+        async with self._ai_sem:
+            return await self._ai.analyse_ff_image(
+                image_data, image_mime,
+                today_date=today_date,
+                is_weekly=is_weekly,
+                week_range=week_range,
+            )
+
+    async def _ai_is_same_story(self, text_a: str, text_b: str, image_a=None) -> bool:
+        async with self._ai_sem:
+            return await self._ai.is_same_story(
+                text_a=text_a, text_b=text_b, image_a=image_a
+            )
+
+    async def _ai_be_careful(self, event_name: str) -> str:
+        async with self._ai_sem:
+            return await self._ai.get_be_careful_line(event_name)
+
+    # ── Connect / disconnect ──────────────────────────────────────────────────
 
     async def start(self):
         session_string = self._cfg.get("session_string", "").strip()
@@ -394,8 +447,8 @@ class ChannelScraper:
             caption_is_ff = _looks_like_ff_caption(text)
 
             if caption_is_ff:
-                # Caption confirms FF — ask AI only for weekly/daily
-                _, ai_is_weekly = await self._ai.detect_ff_image(image_data, image_mime)
+                # Caption already confirmed FF — one AI call just for weekly flag
+                _, ai_is_weekly = await self._ai_detect_ff(image_data, image_mime)
                 cap_is_weekly = any(
                     kw in text.lower() for kw in
                     ("week", "weekly", "this week", "next week",
@@ -408,8 +461,8 @@ class ChannelScraper:
                 )
                 return
             else:
-                # Caption doesn't confirm — ask AI for both
-                ai_is_ff, ai_is_weekly = await self._ai.detect_ff_image(
+                # Caption doesn't confirm — AI decides both is_ff and is_weekly
+                ai_is_ff, ai_is_weekly = await self._ai_detect_ff(
                     image_data, image_mime
                 )
                 if ai_is_ff:
@@ -432,10 +485,11 @@ class ChannelScraper:
         if phash:
             await self._mem.mark_image_seen(phash, source_channel)
 
+        # ── Similarity check (free first, AI only when needed) ────────────────
         if await self._is_similar_to_recent(text, image_data, phash):
             return
 
-        verdict = await self._ai.analyse(text, image_data, image_mime)
+        verdict = await self._ai_analyse(text, image_data, image_mime)
         if not verdict.get("approved"):
             return
 
@@ -457,32 +511,75 @@ class ChannelScraper:
             source_text=text[:1000], post_text=post_text[:1000], image_phash=phash
         )
 
-    # ── Similarity ────────────────────────────────────────────────────────────
+    # ── Similarity — free checks first, AI only as last resort ───────────────
 
     async def _is_similar_to_recent(self, new_text: str, new_image: Optional[bytes],
                                     new_phash: Optional[str] = None) -> bool:
+        """
+        3-layer guard — each layer only runs if the previous didn't decide:
+
+        Layer 1 — phash (zero cost, instant)
+                  Catches identical or near-identical images.
+
+        Layer 2 — keyword + token overlap (zero cost, instant)
+                  Catches same event name (NfP, CPI …) posted twice today.
+                  Also skips AI when texts are obviously unrelated
+                  (overlap ratio < 0.25).
+
+        Layer 3 — AI is_same_story (costs 1 Groq call)
+                  Only fires when token overlap is in the grey zone (0.25–0.75),
+                  meaning the texts share some words but aren't obviously the
+                  same story. Capped at 3 AI calls per message so a burst of
+                  50 similar posts can't drain the quota.
+        """
         try:
-            recent     = await self._mem.get_recent_posts(limit=150)
+            # Pull only 20 recent posts — was 150, 90 % quota reduction
+            recent     = await self._mem.get_recent_posts(limit=20)
             today_date = _eat_now().date()
+            ai_calls   = 0  # hard cap — never more than 3 AI calls here
+
             for old_text, old_phash, old_date_str in recent:
                 old_date = datetime.fromisoformat(old_date_str).date()
+
+                # ── Layer 1: phash (free) ─────────────────────────────────────
                 if new_phash and old_phash:
                     if self._mem.hamming_distance(new_phash, old_phash) <= 3:
                         return True
-                if old_text and new_text:
-                    new_lower = new_text.lower()
-                    old_lower = old_text.lower()
-                    for name in _UNIQUE_EVENT_NAMES:
-                        if name in new_lower and name in old_lower:
-                            if old_date == today_date:
-                                return True
-                    same = await self._ai.is_same_story(
-                        text_a=new_text[:500],
-                        text_b=old_text[:500],
-                        image_a=new_image,
-                    )
-                    if same:
-                        return True
+
+                if not (old_text and new_text):
+                    continue
+
+                new_lower = new_text.lower()
+                old_lower = old_text.lower()
+
+                # ── Layer 2a: unique event name (free) ────────────────────────
+                for name in _UNIQUE_EVENT_NAMES:
+                    if name in new_lower and name in old_lower:
+                        if old_date == today_date:
+                            return True
+
+                # ── Layer 2b: token overlap (free) ────────────────────────────
+                ratio = _text_similarity_ratio(new_text, old_text)
+                if ratio >= 0.75:
+                    # Texts are very similar — treat as duplicate without AI
+                    return True
+                if ratio < 0.25:
+                    # Texts are clearly different — skip AI entirely for this pair
+                    continue
+
+                # ── Layer 3: AI (costs quota) — only in grey zone 0.25–0.75 ──
+                if ai_calls >= 3:
+                    # Hard cap reached — stop checking, assume not duplicate
+                    break
+                same = await self._ai_is_same_story(
+                    text_a=new_text[:500],
+                    text_b=old_text[:500],
+                    image_a=new_image,
+                )
+                ai_calls += 1
+                if same:
+                    return True
+
         except Exception as exc:
             log.error(f"Similarity check error: {exc}")
         return False
@@ -540,7 +637,6 @@ class ChannelScraper:
             if minutes_until < 0:
                 continue
 
-            # Fire at exactly 15 minutes before
             if 14 <= minutes_until <= 16:
                 await self._send_reminder(
                     event, event_key, briefing_msg_id, today_str
@@ -551,7 +647,7 @@ class ChannelScraper:
                              reply_to_msg_id: int, today_str: str):
         event_name   = event.get("name", "Unknown Event")
         impact_emoji = "🔴" if event.get("impact") == "red" else "🟠"
-        be_careful   = await self._ai.get_be_careful_line(event_name)
+        be_careful   = await self._ai_be_careful(event_name)
 
         alert_text = (
             f"🚨 ALERT: 15 MINUTES REMAINING\n\n"
@@ -601,7 +697,7 @@ class ChannelScraper:
             # Lock BEFORE AI
             await self._mem.save_weekly_posted(wkey)
 
-            result = await self._ai.analyse_ff_image(
+            result = await self._ai_analyse_ff(
                 image_data, image_mime,
                 today_date=today_display,
                 is_weekly=True,
@@ -629,7 +725,7 @@ class ChannelScraper:
             # Lock with placeholder BEFORE AI
             await self._mem.save_daily_briefing(today_str, -1, [])
 
-            result = await self._ai.analyse_ff_image(
+            result = await self._ai_analyse_ff(
                 image_data, image_mime,
                 today_date=today_display,
                 is_weekly=False,
@@ -655,7 +751,6 @@ class ChannelScraper:
             ]
 
             if not events:
-                # No events today
                 quiet = "🟢 No major news today — markets expected calm. Trade safe."
                 quiet = _add_signature(quiet)
                 sent  = await self._send_file(image_data, image_mime, quiet)
@@ -667,7 +762,6 @@ class ChannelScraper:
 
             self._todays_vip = self._select_vip_events(events)
 
-            # Build post
             has_red   = any(e["impact"] == "red" for e in events)
             title     = (
                 "TODAY'S USD 🇺🇸 HIGH IMPACT NEWS" if has_red
