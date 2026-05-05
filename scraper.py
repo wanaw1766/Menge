@@ -8,16 +8,6 @@ scraper.py — AXIOM INTEL channel scraper and forwarder.
 - Time: 12h AM/PM no leading zero (3:30 PM not 03:30 PM)
 - All duplicate locks BEFORE AI call
 - Silent logging
-- AI calls protected by semaphore + similarity capped at 3
-
-SIMILARITY IMPROVEMENTS:
-- Layer 1 (phash): unchanged — instant image dedup
-- Layer 2a (unique event name): only blocks SAME DAY exact event name
-- Layer 2b (token overlap): threshold raised — 0.80 to mark dup, 0.25 to skip AI
-  (was 0.75 / 0.25 — less aggressive on similar-topic but different-event news)
-- Layer 2c (entity check): if stories mention different named entities → NOT dup
-- Layer 3 (AI): confidence threshold raised to 0.80, hard cap stays at 3 calls
-- Recent posts window: 30 (was 20) for better coverage without quota drain
 """
 
 import asyncio
@@ -73,15 +63,6 @@ GEOPOLITICAL_KEYWORDS = [
     "geopolitical", "oil supply", "ukraine", "russia", "biden", "putin", "xi",
 ]
 
-# Named entities — if two stories mention DIFFERENT ones, they are different stories
-_NAMED_ENTITIES = [
-    "trump", "powell", "biden", "putin", "xi", "lagarde", "bailey",
-    "iran", "ukraine", "russia", "china", "europe", "israel", "gaza",
-    "opec", "nato", "fed", "ecb", "boj", "boe", "rba", "snb",
-    "gold", "oil", "crude", "nfp", "cpi", "gdp", "pce",
-    "dollar", "euro", "yen", "pound", "bitcoin",
-]
-
 # Bulletproof event regex — handles all AI output variations
 _EVENT_PATTERN = re.compile(
     r"(🔴|🟠)\s+(\d{1,2}:\d{2}\s*[AP]M)\s*\|\s*([A-Z]{3})\s*:\s*(.+?)(?=\n|$)",
@@ -130,6 +111,7 @@ def _eat_today_str() -> str:
 
 
 def _eat_today_display() -> str:
+    # No leading zero on day — matches FF image "Fri May 1" not "Fri May 01"
     return _eat_now().strftime("%A, %B %-d, %Y")
 
 
@@ -165,34 +147,19 @@ def _normalise_urls(text: str) -> str:
     )
 
 
-def _text_similarity_ratio(a: str, b: str) -> float:
-    """
-    Fast token-overlap ratio — zero AI cost.
-    Returns 0.0 (no overlap) to 1.0 (identical).
-    Uses Jaccard similarity on 4+ char tokens.
-    """
-    if not a or not b:
-        return 0.0
-    tokens_a = set(re.findall(r'\b\w{4,}\b', a.lower()))
-    tokens_b = set(re.findall(r'\b\w{4,}\b', b.lower()))
-    if not tokens_a or not tokens_b:
-        return 0.0
-    intersection = tokens_a & tokens_b
-    union        = tokens_a | tokens_b
-    return len(intersection) / len(union)
-
-
-def _extract_named_entities(text: str) -> set:
-    """Extract which named entities appear in this text."""
-    t = text.lower()
-    return {e for e in _NAMED_ENTITIES if e in t}
-
-
 def _extract_events(text: str) -> List[dict]:
     """
     Parse AI output line by line, group same-time events.
     Returns list sorted by time ascending.
+    FIX: normalize literal \\n (from JSON encoding) to real newlines first.
     """
+    if not text:
+        return []
+
+    # Gemini sometimes encodes newlines as literal \n inside JSON strings
+    # This causes splitlines() to see ONE long line → grouping fails
+    text = text.replace("\\n", "\n")
+
     raw = []
     for line in text.splitlines():
         line = line.strip()
@@ -207,7 +174,7 @@ def _extract_events(text: str) -> List[dict]:
             try:
                 dt       = datetime.strptime(time_str, fmt)
                 time_24h = dt.strftime("%H:%M")
-                time_12h = dt.strftime("%-I:%M %p")
+                time_12h = dt.strftime("%-I:%M %p")  # "3:30 PM" not "03:30 PM"
                 break
             except ValueError:
                 continue
@@ -224,6 +191,7 @@ def _extract_events(text: str) -> List[dict]:
     if not raw:
         return []
 
+    # Group by time_24h — same slot → comma-joined names, red wins
     grouped: dict = {}
     for e in raw:
         key = e["time_24h"]
@@ -261,9 +229,6 @@ class ChannelScraper:
         self._ai  = ai_engine
         self._mem = memory
 
-        # ── Groq quota guard — max 2 AI calls running at the same time ────────
-        self._ai_sem = asyncio.Semaphore(2)
-
         self._dest_channels: List[str] = config.get("dest_channels", [])
         if not self._dest_channels:
             single = config.get("dest_channel", "")
@@ -284,39 +249,6 @@ class ChannelScraper:
             else config.get("session_name", "manager_session")
         )
         self._client = TelegramClient(session, config["api_id"], config["api_hash"])
-
-    # ── Safe AI wrappers (all quota-protected) ────────────────────────────────
-
-    async def _ai_detect_ff(self, image_data: bytes, image_mime: str):
-        async with self._ai_sem:
-            return await self._ai.detect_ff_image(image_data, image_mime)
-
-    async def _ai_analyse(self, text: str, image_data, image_mime: str):
-        async with self._ai_sem:
-            return await self._ai.analyse(text, image_data, image_mime)
-
-    async def _ai_analyse_ff(self, image_data: bytes, image_mime: str,
-                             today_date: str, is_weekly: bool,
-                             week_range: str = ""):
-        async with self._ai_sem:
-            return await self._ai.analyse_ff_image(
-                image_data, image_mime,
-                today_date=today_date,
-                is_weekly=is_weekly,
-                week_range=week_range,
-            )
-
-    async def _ai_is_same_story(self, text_a: str, text_b: str, image_a=None) -> bool:
-        async with self._ai_sem:
-            return await self._ai.is_same_story(
-                text_a=text_a, text_b=text_b, image_a=image_a
-            )
-
-    async def _ai_be_careful(self, event_name: str) -> str:
-        async with self._ai_sem:
-            return await self._ai.get_be_careful_line(event_name)
-
-    # ── Connect / disconnect ──────────────────────────────────────────────────
 
     async def start(self):
         session_string = self._cfg.get("session_string", "").strip()
@@ -471,7 +403,8 @@ class ChannelScraper:
             caption_is_ff = _looks_like_ff_caption(text)
 
             if caption_is_ff:
-                _, ai_is_weekly = await self._ai_detect_ff(image_data, image_mime)
+                # Caption confirms FF — ask AI only for weekly/daily
+                _, ai_is_weekly = await self._ai.detect_ff_image(image_data, image_mime)
                 cap_is_weekly = any(
                     kw in text.lower() for kw in
                     ("week", "weekly", "this week", "next week",
@@ -484,7 +417,8 @@ class ChannelScraper:
                 )
                 return
             else:
-                ai_is_ff, ai_is_weekly = await self._ai_detect_ff(
+                # Caption doesn't confirm — ask AI for both
+                ai_is_ff, ai_is_weekly = await self._ai.detect_ff_image(
                     image_data, image_mime
                 )
                 if ai_is_ff:
@@ -498,7 +432,8 @@ class ChannelScraper:
 
         if await self._mem.is_duplicate(content_hash):
             return
-        if phash and await self._mem.is_image_duplicate(phash, max_distance=3):
+        # max_distance=10 — catches same news image zoomed, cropped, resized
+        if phash and await self._mem.is_image_duplicate(phash, max_distance=10):
             await self._mem.mark_image_seen(phash, source_channel)
             return
 
@@ -507,11 +442,10 @@ class ChannelScraper:
         if phash:
             await self._mem.mark_image_seen(phash, source_channel)
 
-        # ── Similarity check (free first, AI only when needed) ────────────────
         if await self._is_similar_to_recent(text, image_data, phash):
             return
 
-        verdict = await self._ai_analyse(text, image_data, image_mime)
+        verdict = await self._ai.analyse(text, image_data, image_mime)
         if not verdict.get("approved"):
             return
 
@@ -533,92 +467,60 @@ class ChannelScraper:
             source_text=text[:1000], post_text=post_text[:1000], image_phash=phash
         )
 
-    # ── Similarity — free checks first, AI only as last resort ───────────────
+    # ── Similarity ────────────────────────────────────────────────────────────
 
     async def _is_similar_to_recent(self, new_text: str, new_image: Optional[bytes],
                                     new_phash: Optional[str] = None) -> bool:
-        """
-        4-layer duplicate guard:
-
-        Layer 1 — phash (zero cost, instant)
-                  Catches identical or near-identical images.
-
-        Layer 2a — unique event name (zero cost, instant)
-                  Same exact VIP event name (NFP, CPI…) posted SAME DAY = duplicate.
-                  Different day = allowed through (could be a revision or new release).
-
-        Layer 2b — token overlap Jaccard (zero cost, instant)
-                  ≥ 0.80 → definite duplicate (same words, same story)
-                  < 0.25 → clearly different, skip AI entirely
-                  0.25–0.80 → grey zone, proceed to Layer 2c
-
-        Layer 2c — named entity check (zero cost, instant)  ← NEW
-                  If the two stories mention DIFFERENT named entities
-                  (different countries, people, economic events) → NOT duplicate.
-                  Prevents blocking e.g. "Russia strikes Ukraine" vs "Israel strikes Gaza"
-                  just because they both use "strikes".
-
-        Layer 3 — AI is_same_story (costs 1 API call)
-                  Only fires in the grey zone after entity check passes.
-                  Hard cap: 3 AI calls per message.
-                  Confidence threshold: 0.80 (raised from 0.75).
-        """
         try:
-            # Increased to 30 for better coverage (was 20)
-            recent     = await self._mem.get_recent_posts(limit=30)
+            recent     = await self._mem.get_recent_posts(limit=150)
             today_date = _eat_now().date()
-            ai_calls   = 0
-
-            new_entities = _extract_named_entities(new_text) if new_text else set()
-
             for old_text, old_phash, old_date_str in recent:
                 old_date = datetime.fromisoformat(old_date_str).date()
 
-                # ── Layer 1: phash (free) ─────────────────────────────────────
+                # ── Image similarity — catches zoom/crop/resize ────────────
                 if new_phash and old_phash:
-                    if self._mem.hamming_distance(new_phash, old_phash) <= 3:
+                    dist = self._mem.hamming_distance(new_phash, old_phash)
+                    if dist <= 10:
                         return True
 
-                if not (old_text and new_text):
+                if not old_text or not new_text:
                     continue
 
                 new_lower = new_text.lower()
                 old_lower = old_text.lower()
 
-                # ── Layer 2a: unique event name — SAME DAY only ───────────────
+                # ── Critical event name match same day ────────────────────
                 for name in _UNIQUE_EVENT_NAMES:
                     if name in new_lower and name in old_lower:
                         if old_date == today_date:
                             return True
-                        # Different day — allow through (may be update/revision)
 
-                # ── Layer 2b: token overlap (free) ────────────────────────────
-                ratio = _text_similarity_ratio(new_text, old_text)
-                if ratio >= 0.80:
-                    return True
-                if ratio < 0.25:
-                    # Clearly different — skip entity check and AI for this pair
-                    continue
+                # ── Hard keyword overlap — same topic same day ─────────────
+                # If 3+ key financial terms match → likely same story
+                key_terms = [
+                    "fomc", "federal reserve", "fed rate", "powell",
+                    "nfp", "non-farm", "payroll", "cpi", "inflation",
+                    "gdp", "pce", "unemployment", "retail sales",
+                    "gold", "xauusd", "oil", "crude", "hormuz",
+                    "trump", "tariff", "sanction", "iran", "ukraine",
+                    "dxy", "dollar index",
+                ]
+                if old_date == today_date:
+                    overlap = sum(
+                        1 for term in key_terms
+                        if term in new_lower and term in old_lower
+                    )
+                    # 2+ matching key terms on same day = same story
+                    if overlap >= 2:
+                        return True
 
-                # ── Layer 2c: named entity check (free) ── NEW ────────────────
-                old_entities = _extract_named_entities(old_text)
-                if new_entities and old_entities:
-                    shared = new_entities & old_entities
-                    if not shared:
-                        # Different entities = genuinely different stories
-                        # Do NOT call AI — move to next recent post
-                        continue
-                    # If entities overlap, still need AI to confirm same event
-
-                # ── Layer 3: AI (costs quota) — only in grey zone ─────────────
-                if ai_calls >= 3:
-                    break
-                same = await self._ai_is_same_story(
+                # ── AI similarity — hard threshold 0.45 ───────────────────
+                # Lower threshold = more aggressive duplicate blocking
+                same = await self._ai.is_same_story(
                     text_a=new_text[:500],
                     text_b=old_text[:500],
                     image_a=new_image,
                 )
-                ai_calls += 1
                 if same:
                     return True
 
@@ -679,6 +581,7 @@ class ChannelScraper:
             if minutes_until < 0:
                 continue
 
+            # Fire at exactly 15 minutes before
             if 14 <= minutes_until <= 16:
                 await self._send_reminder(
                     event, event_key, briefing_msg_id, today_str
@@ -689,7 +592,7 @@ class ChannelScraper:
                              reply_to_msg_id: int, today_str: str):
         event_name   = event.get("name", "Unknown Event")
         impact_emoji = "🔴" if event.get("impact") == "red" else "🟠"
-        be_careful   = await self._ai_be_careful(event_name)
+        be_careful   = await self._ai.get_be_careful_line(event_name)
 
         alert_text = (
             f"🚨 ALERT: 15 MINUTES REMAINING\n\n"
@@ -724,8 +627,9 @@ class ChannelScraper:
         phash         = self._mem.compute_phash(image_data)
 
         # Lock phash BEFORE AI call
+        # max_distance=15 — catches same calendar zoomed, cropped, resized
         if phash:
-            if await self._mem.is_image_duplicate(phash, max_distance=3):
+            if await self._mem.is_image_duplicate(phash, max_distance=15):
                 return
             await self._mem.mark_image_seen(phash, source_channel)
 
@@ -736,9 +640,10 @@ class ChannelScraper:
             if await self._mem.has_weekly_posted(wkey):
                 return
 
+            # Lock BEFORE AI
             await self._mem.save_weekly_posted(wkey)
 
-            result = await self._ai_analyse_ff(
+            result = await self._ai.analyse_ff_image(
                 image_data, image_mime,
                 today_date=today_display,
                 is_weekly=True,
@@ -763,9 +668,10 @@ class ChannelScraper:
             if await self._mem.has_daily_briefing(today_str):
                 return
 
+            # Lock with placeholder BEFORE AI
             await self._mem.save_daily_briefing(today_str, -1, [])
 
-            result = await self._ai_analyse_ff(
+            result = await self._ai.analyse_ff_image(
                 image_data, image_mime,
                 today_date=today_display,
                 is_weekly=False,
@@ -781,6 +687,7 @@ class ChannelScraper:
 
             events = _extract_events(raw_text)
 
+            # Filter geopolitical from calendar
             events = [
                 e for e in events
                 if not any(
@@ -790,6 +697,7 @@ class ChannelScraper:
             ]
 
             if not events:
+                # No events today
                 quiet = "🟢 No major news today — markets expected calm. Trade safe."
                 quiet = _add_signature(quiet)
                 sent  = await self._send_file(image_data, image_mime, quiet)
@@ -801,6 +709,7 @@ class ChannelScraper:
 
             self._todays_vip = self._select_vip_events(events)
 
+            # Build post
             has_red   = any(e["impact"] == "red" for e in events)
             title     = (
                 "TODAY'S USD 🇺🇸 HIGH IMPACT NEWS" if has_red
