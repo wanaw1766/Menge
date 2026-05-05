@@ -103,61 +103,41 @@ ALWAYS APPROVE — NO EXCEPTIONS:
 1. FOMC / Fed decisions — rate held, cut, raised (any bps)
 2. Fed Chair Powell speaking
 3. Any world leader statement affecting: Oil, Gold, USD, tariffs, war, sanctions
-4. Geopolitical events: war, missile, strike, sanctions, Hormuz, Ukraine, Trump, Putin
+   (Trump, Biden, Putin, Xi, Iran, OPEC, NATO)
+4. Geopolitical events: war, missile, strike, sanctions, Hormuz, Ukraine
 5. Actual released economic data with real numbers:
    "CPI came at 2.8%", "NFP 250K", "GDP rose 2.1%", "raised by 25bps"
-6. Price level hits — when a real market price reaches a key level:
-   "Gold hits $3500", "DXY breaks below 100", "Oil surges to $95"
-   These are REAL NEWS events, NOT technical analysis
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ALWAYS REJECT:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. Signals — Buy/Sell/Long/Short/Entry/TP/SL/price targets
-2. Technical analysis — support/resistance, RSI, MACD, patterns, indicators
-3. Chart screenshots with TA drawings
-4. Memes, jokes, informal content
+1. Signals — Buy/Sell/Long/Short/Entry/TP/SL
+2. Technical analysis — patterns, indicators, charts
+3. Memes, jokes, informal content
+4. Chart screenshots, TA images
 5. Another channel watermark or username
 6. Content older than 18 hours
 7. Forecast/Previous values — "forecast 180K", "previous 2.3%"
-8. Opinions — "I think", "expect", "my analysis", "I believe"
-9. Sentiment — Fear & Greed, COT, smart money, VIX index
-10. Bank sentiment — "banks are bullish/bearish", "smart money positioning"
+8. Opinions — "I think", "expect", "my analysis"
+9. Sentiment — Fear & Greed, COT, smart money, VIX
+10. Bank sentiment — "banks are bullish/bearish"
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT (approved posts only):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-EMOJI RULES — choose based on content:
-- 🚨 Breaking news, urgent geopolitical
-- 🌍 Geopolitical events, world leaders
-- 🏦 Central bank, Fed, FOMC decisions
-- 🛢️ Oil, energy news
-- 📊 Economic data released (CPI, NFP, GDP)
-- 📈 Price rising, market up, bullish move
-- 📉 Price falling, market down, bearish move
-- 🏆 All time high, record price hit
-- 💵 Dollar, USD, DXY moves
-- ⚠️ Warning, risk event
-- 🗳️ Political, election
-
-[EMOJI] [SHORT FACTUAL HEADLINE — one line]
+[EMOJI] [SHORT FACTUAL HEADLINE]
 
 [2-4 sentences. Real numbers allowed. No forecast. No previous.]
 
-HASHTAGS — based ONLY on what the news actually affects:
-- News moves Gold price → add #XAUUSD
-- News moves USD/Dollar/DXY → add #DXY
-- News moves Oil price → add #OIL
-- One news can affect multiple → add all that apply
-- If news affects NONE of these → add NO hashtag
-- NEVER add a hashtag just because the word appears — only if price is affected
+HASHTAGS — add ALL that apply:
+- Affects Gold → #XAUUSD
+- Affects USD/Dollar → #DXY
+- Affects Oil → #OIL
+- FOMC/Fed → always #DXY #XAUUSD
+- Geopolitical/war → depends on impact
+- Never add any other hashtag
 
-EXAMPLES:
-"Fed holds rates" → #DXY #XAUUSD (affects both)
-"Iran closes Hormuz" → #OIL #XAUUSD (oil supply + gold safe haven)
-"Trump tariffs on China" → #DXY #OIL (trade war affects both)
-"Gold hits $3500 ATH" → #XAUUSD only
-"NFP 250K beats" → #DXY #XAUUSD (jobs data = dollar + gold move)
+EMOJI: 🚨 🌍 📊 🏦 🛢️ 🏆 💵 ⚠️ 🗳️
 
 DO NOT add signature. DO NOT add year. NO asterisks. NO bold.
 
@@ -566,7 +546,6 @@ class AIEngine:
             story_a=(text_a[:500] if text_a else ""),
             story_b=(text_b[:500] if text_b else ""),
         )
-        # Try Gemini
         try:
             parts = []
             if image_a:
@@ -580,15 +559,9 @@ class AIEngine:
                 timeout=20
             )
             data = _parse_json(resp.text)
-            same = bool(data.get("same_story", False))
-            conf = data.get("confidence", 0)
-            # Hard threshold: 0.45 — more aggressive duplicate blocking
-            # Source A says "Fed holds rates" Source B says "FOMC keeps rate unchanged"
-            # Both should be blocked as same story
-            return same and conf >= 0.45
+            return bool(data.get("same_story", False)) and data.get("confidence", 0) >= 0.55
         except Exception:
             pass
-        # Groq fallback
         try:
             resp = await asyncio.wait_for(
                 self._groq.chat.completions.create(
@@ -599,9 +572,7 @@ class AIEngine:
                 timeout=25,
             )
             data = _parse_json(resp.choices[0].message.content)
-            same = bool(data.get("same_story", False))
-            conf = data.get("confidence", 0)
-            return same and conf >= 0.45
+            return bool(data.get("same_story", False)) and data.get("confidence", 0) >= 0.55
         except Exception:
             return False
 
