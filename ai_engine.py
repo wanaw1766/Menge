@@ -5,6 +5,7 @@ ai_engine.py — AXIOM INTEL AI Engine.
 - Hashtags: #XAUUSD #DXY #OIL only where relevant.
 - FF calendar: daily once/day, weekly once/week.
 - Geopolitical/FOMC always approved.
+- Same-time events: comma-joined on ONE line.
 """
 
 import asyncio
@@ -157,24 +158,26 @@ TASK:
    If different date → {{"approved": false, "reason": "wrong date"}}
 
 2. Extract ALL USD 🔴 (high impact) and 🟠 (medium impact) events.
-   Write EACH event on its OWN line — even if same time.
 
-3. Format rules:
-   - Time: 12-hour AM/PM only, NO leading zero (3:30 PM not 03:30 PM)
-   - NO year in date line
-   - NO forecast, NO previous values
-   - NO hashtags
-   - NO "Be careful" line
-   - NO signature
-   - Plain text only
+3. CRITICAL SAME-TIME RULE:
+   - Multiple events at the SAME time → ONE line, ALL names comma-separated
+   - Event with no time shown → it shares the time of the event above it
+   - Use the HIGHEST impact emoji when mixing red/orange at same time
+   - Time: 12-hour AM/PM, NO leading zero (5:00 PM not 05:00 PM)
+   - NO forecast, NO previous values, NO hashtags, NO "Be careful", NO signature
 
-EXACT FORMAT:
+EXAMPLE — 3 events all at 5:00 PM becomes ONE line:
 TODAY'S USD HIGH IMPACT NEWS
-Thursday, April 30
+Tuesday, May 5
 
-🔴 3:30 PM | USD: Advance GDP q/q
-🔴 3:30 PM | USD: Core PCE Price Index m/m
-🟠 5:00 PM | USD: Unemployment Claims
+🔴 5:00 PM | USD: ISM Services PMI, JOLTS Job Openings, New Home Sales
+
+EXAMPLE — mixed times, each time on its own line:
+TODAY'S USD HIGH IMPACT NEWS
+Friday, May 8
+
+🔴 3:30 PM | USD: Average Hourly Earnings m/m, Non-Farm Employment Change, Unemployment Rate
+🟠 5:00 PM | USD: Prelim UoM Consumer Sentiment, Prelim UoM Inflation Expectations
 
 If valid → {{"approved": true, "reason": "valid daily FF", "formatted_text": "..."}}
 If invalid → {{"approved": false, "reason": "..."}}
@@ -191,27 +194,30 @@ TASK:
    If only one day → {{"approved": false, "reason": "not weekly"}}
 
 2. Extract ALL USD 🔴 and 🟠 events grouped by day.
-   Each event on its OWN line.
 
-3. Format rules:
+3. CRITICAL SAME-TIME RULE:
+   - Multiple events at the SAME time → ONE line, ALL names comma-separated
+   - Event with no time shown → it shares the time of the event above it
+   - Use the HIGHEST impact emoji when mixing red/orange at same time
    - Time: 12-hour AM/PM, NO leading zero (3:30 PM not 03:30 PM)
-   - NO year in dates
-   - NO forecast, NO previous
-   - NO hashtags
-   - NO "Be careful" line
-   - NO signature
-   - Plain text only
+   - NO forecast, NO previous, NO hashtags, NO "Be careful", NO signature
 
-EXACT FORMAT:
+EXACT FORMAT EXAMPLE (matches real FF calendar structure):
 WEEKLY HIGH IMPACT NEWS
 Week of May 5 – May 9
 
-Monday — May 5
-🟠 5:00 PM | USD: ISM Services PMI
+Tuesday — May 5
+🔴 5:00 PM | USD: ISM Services PMI, JOLTS Job Openings, New Home Sales
 
-Wednesday — May 7
-🔴 3:30 PM | USD: CPI m/m
-🔴 3:30 PM | USD: Core CPI m/m
+Wednesday — May 6
+🟠 3:15 PM | USD: ADP Non-Farm Employment Change
+
+Thursday — May 7
+🟠 3:30 PM | USD: Unemployment Claims
+
+Friday — May 8
+🔴 3:30 PM | USD: Average Hourly Earnings m/m, Non-Farm Employment Change, Unemployment Rate
+🟠 5:00 PM | USD: Prelim UoM Consumer Sentiment, Prelim UoM Inflation Expectations
 
 If valid → {{"approved": true, "reason": "valid weekly FF", "formatted_text": "..."}}
 If invalid → {{"approved": false, "reason": "..."}}
@@ -316,9 +322,9 @@ def _validate_and_clean(data: dict) -> dict:
             text = re.sub(r"#\w+", "", text).strip()
         else:
             # Regular news — keep only allowed hashtags
-            found    = re.findall(r"#\w+", text)
-            allowed  = [h for h in found if h in ALLOWED_HASHTAGS]
-            text     = re.sub(r"#\w+", "", text).strip()
+            found   = re.findall(r"#\w+", text)
+            allowed = [h for h in found if h in ALLOWED_HASHTAGS]
+            text    = re.sub(r"#\w+", "", text).strip()
             if allowed:
                 text = text.rstrip() + "\n\n" + " ".join(allowed)
 
