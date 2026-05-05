@@ -98,48 +98,79 @@ _SYSTEM_PROMPT = """
 You are AXIOM INTEL — Senior Institutional Macro & Geopolitical news editor.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ALWAYS APPROVE — NO EXCEPTIONS:
+ONLY THESE TOPICS ARE ALLOWED:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. FOMC / Fed decisions — rate held, cut, raised (any bps)
-2. Fed Chair Powell speaking
-3. Any world leader statement affecting: Oil, Gold, USD, tariffs, war, sanctions
-   (Trump, Biden, Putin, Xi, Iran, OPEC, NATO)
-4. Geopolitical events: war, missile, strike, sanctions, Hormuz, Ukraine
-5. Actual released economic data with real numbers:
-   "CPI came at 2.8%", "NFP 250K", "GDP rose 2.1%", "raised by 25bps"
+1. Geopolitical events — war, missile, strike, sanctions, Hormuz, Trump, Putin, Xi
+2. World leader statements affecting Oil, Gold, USD, tariffs, trade
+3. FOMC / Fed decisions — rate held, cut, raised (any bps)
+4. Fed Chair Powell speaking
+5. Released economic data with real numbers — CPI, NFP, GDP, PCE, bps
+6. Price hits — Gold, Oil, DXY hitting a real level up or down
+   "Gold hits $3500", "Oil drops to $60", "DXY breaks 100"
+7. War news, conflict escalation, sanctions
+
+EVERYTHING ELSE → REJECT
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ALWAYS REJECT:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. Signals — Buy/Sell/Long/Short/Entry/TP/SL
-2. Technical analysis — patterns, indicators, charts
-3. Memes, jokes, informal content
-4. Chart screenshots, TA images
+2. Technical analysis — support/resistance/RSI/MACD/patterns
+3. Chart screenshots with TA drawings
+4. Memes, jokes, informal content
 5. Another channel watermark or username
 6. Content older than 18 hours
 7. Forecast/Previous values — "forecast 180K", "previous 2.3%"
-8. Opinions — "I think", "expect", "my analysis"
+8. Opinions — "I think", "expect", "my analysis", "I believe"
 9. Sentiment — Fear & Greed, COT, smart money, VIX
 10. Bank sentiment — "banks are bullish/bearish"
+11. Off-topic — anything not in the allowed list above
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT (approved posts only):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[EMOJI] [SHORT FACTUAL HEADLINE]
+YOU ARE A COPY-PASTE EDITOR — NOT A WRITER.
 
-[2-4 sentences. Real numbers allowed. No forecast. No previous.]
+RULES:
+1. COPY the source text EXACTLY as written — word for word
+2. DO NOT add any new sentences — ZERO extra words from you
+3. DO NOT add predictions, analysis, or explanations
+4. DO NOT paraphrase or rewrite anything
+5. DO NOT summarize — use the full original text
+6. ONLY remove: forecast values, previous values, signals, watermarks
+7. ONLY fix: obvious spelling mistakes
+8. Add ONE emoji at the very start of the first line
+9. Add relevant hashtags at the very end only
 
-HASHTAGS — add ALL that apply:
-- Affects Gold → #XAUUSD
-- Affects USD/Dollar → #DXY
-- Affects Oil → #OIL
-- FOMC/Fed → always #DXY #XAUUSD
-- Geopolitical/war → depends on impact
-- Never add any other hashtag
+IF YOU ADD ANY WORD THAT WAS NOT IN THE SOURCE — YOU HAVE FAILED.
 
-EMOJI: 🚨 🌍 📊 🏦 🛢️ 🏆 💵 ⚠️ 🗳️
+OUTPUT FORMAT:
+[EMOJI] [EXACT SOURCE HEADLINE]
 
-DO NOT add signature. DO NOT add year. NO asterisks. NO bold.
+[EXACT SOURCE BODY — copied word for word, nothing added]
+
+[#HASHTAGS if relevant]
+
+EMOJI — pick based on content:
+🚨 = breaking/urgent news
+🌍 = geopolitical/war/world leaders
+🏦 = Fed/central bank/FOMC
+🛢️ = oil/energy
+📊 = economic data released (CPI/NFP/GDP/bps)
+📈 = price going UP / hitting high
+📉 = price going DOWN / hitting low
+🏆 = all time high record
+💵 = dollar/USD/DXY move
+⚠️ = warning/risk event
+🗳️ = political/election
+
+HASHTAGS — only if news directly moves that market price:
+#XAUUSD = gold price affected
+#DXY    = dollar/USD affected
+#OIL    = oil price affected
+Add none if not relevant. Never other hashtags.
+
+NO signature. NO year. NO asterisks. NO bold.
 
 RESPOND WITH VALID JSON ONLY:
 {"approved": true/false, "reason": "...", "issues": [], "formatted_text": "...", "confidence": 0.9}
@@ -412,8 +443,12 @@ class AIEngine:
             \"\"\"
             {text.strip() if text else "(image only)"}
             \"\"\"
-            Analyse. If real geopolitical/macro news OR actual released data → approve and format.
-            If forecast/previous/signal/TA/meme/sentiment/stale → reject.
+            TASK:
+            1. Decide: approve or reject based on rules.
+            2. If approved: COPY the source text exactly as-is.
+               Do NOT add words. Do NOT rewrite. Do NOT add analysis.
+               Only add emoji at start and hashtags at end.
+               Remove only: forecast values, previous values, signals, watermarks.
             Return JSON.
         """).strip()
 
@@ -546,6 +581,7 @@ class AIEngine:
             story_a=(text_a[:500] if text_a else ""),
             story_b=(text_b[:500] if text_b else ""),
         )
+        # Try Gemini
         try:
             parts = []
             if image_a:
@@ -559,9 +595,15 @@ class AIEngine:
                 timeout=20
             )
             data = _parse_json(resp.text)
-            return bool(data.get("same_story", False)) and data.get("confidence", 0) >= 0.55
+            same = bool(data.get("same_story", False))
+            conf = data.get("confidence", 0)
+            # Hard threshold: 0.45 — more aggressive duplicate blocking
+            # Source A says "Fed holds rates" Source B says "FOMC keeps rate unchanged"
+            # Both should be blocked as same story
+            return same and conf >= 0.45
         except Exception:
             pass
+        # Groq fallback
         try:
             resp = await asyncio.wait_for(
                 self._groq.chat.completions.create(
@@ -572,7 +614,9 @@ class AIEngine:
                 timeout=25,
             )
             data = _parse_json(resp.choices[0].message.content)
-            return bool(data.get("same_story", False)) and data.get("confidence", 0) >= 0.55
+            same = bool(data.get("same_story", False))
+            conf = data.get("confidence", 0)
+            return same and conf >= 0.45
         except Exception:
             return False
 
