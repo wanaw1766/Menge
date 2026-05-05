@@ -174,38 +174,65 @@ Good output: "Trump announces 50% tariffs on EU goods starting June"
 → Kept exactly. Only watermark removed if present.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-HASHTAG RULES — STRICT:
+HASHTAG RULES — EXACT MATCH ONLY:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Only add hashtags when the news is DIRECTLY and CLEARLY about that asset.
+One hashtag per asset. Only use the hashtag for the asset the news is DIRECTLY about.
 
-#XAUUSD → ONLY if news directly mentions Gold, XAU, safe-haven
-#DXY    → ONLY if news directly mentions USD, Dollar, Fed, FOMC, US rates
-#OIL    → ONLY if news directly mentions Oil, crude, OPEC, energy, Hormuz
+#OIL    → news is about Oil, crude, OPEC, energy supply, Hormuz
+#XAUUSD → news is about Gold, XAU price
+#DXY    → news is about USD, Dollar, Fed, FOMC, US interest rates, US economic data
 
-FOMC/Fed rate decision → always #DXY #XAUUSD
-Gold price news → #XAUUSD only (not #DXY unless Dollar explicitly mentioned)
-Oil supply news → #OIL only
-Geopolitical war news → only if oil/gold explicitly affected in the source
+STRICT ONE-ASSET RULE:
+- Oil news → #OIL only. Nothing else.
+- Gold news → #XAUUSD only. Nothing else.
+- Fed/USD/data news → #DXY only. Nothing else.
 
-DO NOT add hashtags just because the news is "related" or "could affect" an asset.
-The source must explicitly mention it.
-Never add any hashtag other than #XAUUSD #DXY #OIL.
-No "HASHTAGS:" label — just put the tags on their own line at the end.
+ONLY use multiple hashtags when the news EXPLICITLY mentions multiple assets BY NAME:
+- "Oil drops, Gold surges on Middle East tension" → #OIL #XAUUSD
+- "Fed rate cut sends Gold higher and Dollar lower" → #DXY #XAUUSD
+- "OPEC cut drives Oil and Gold rally" → #OIL #XAUUSD
+- Never guess or assume impact — only what is written in the news
 
-CORRECT HASHTAG EXAMPLE:
-🚨 Iranian drones hit UAE vessel in Hormuz strait.
-Oil tanker traffic disrupted as tensions escalate.
+EXAMPLES:
+"OPEC cuts production by 500K barrels" → #OIL
+"Gold hits $3,400 all time high" → #XAUUSD
+"Fed holds rates at 4.5%" → #DXY
+"NFP came at 177K" → #DXY
+"Trump announces 50% EU tariffs" → #DXY
+"Iranian strike hits Hormuz oil tanker" → #OIL
+"Oil drops, Gold and Dollar rally on Fed news" → #OIL #XAUUSD #DXY
 
-#OIL
+NEVER:
+- Never add #DXY to oil news just because oil affects the dollar
+- Never add #XAUUSD to oil news just because gold moves with oil
+- Never add #OIL to Fed news just because rates affect energy
+- Never use any hashtag not in this list: #OIL #XAUUSD #DXY
+- Never write "HASHTAGS:" label — just the tags on one line at the end
 
-WRONG — do not add extra tags not in source:
-🚨 Iranian drones hit UAE vessel.
-#OIL #XAUUSD #DXY
-→ Gold and Dollar not mentioned in source — do not add.
+EMOJI RULES — REQUIRED:
+- ALWAYS start the post with an emoji — never post without one
+- If source already has an emoji → keep it exactly, use it as the first character
+- If source has NO emoji → pick the most relevant one from this list:
+  🚨 breaking/urgent news
+  🌍 geopolitical / world event
+  📊 economic data release
+  🏦 central bank / Fed / FOMC
+  🛢️ oil / energy / OPEC
+  🏆 gold / XAU hitting level
+  💵 dollar / DXY
+  ⚠️ warning / risk event
+  🗳️ political / election
+  🇺🇸 US specific news / Trump
 
-EMOJI: Only keep emoji from source. If source has none, add ONE relevant emoji:
-🚨 breaking/urgent  🌍 geopolitical  📊 data release
-🏦 central bank  🛢️ oil  🏆 gold  💵 dollar  ⚠️ warning  🗳️ political  🇺🇸 US
+MATCHING GUIDE:
+- War / strike / sanctions → 🚨
+- FOMC / Fed / Powell → 🏦
+- NFP / CPI / GDP / data → 📊
+- Oil / OPEC / Hormuz → 🛢️
+- Gold price hit → 🏆
+- Trump / tariffs / trade → 🚨 or 🇺🇸
+- Dollar strength/weakness → 💵
+- Geopolitical tension → 🌍
 
 DO NOT add signature. DO NOT add year. NO asterisks. NO bold.
 
@@ -433,17 +460,69 @@ def _validate_and_clean(data: dict) -> dict:
         # Calendar posts — strip ALL hashtags
         if text.startswith("TODAY'S USD") or text.startswith("WEEKLY HIGH IMPACT"):
             text = re.sub(r"#\w+", "", text).strip()
+        # Regular news — exact asset hashtag matching
         else:
-            # Regular news — keep only allowed hashtags
+            t_lower = text.lower()
             found   = re.findall(r"#\w+", text)
-            allowed = [h for h in found if h in ALLOWED_HASHTAGS]
             text    = re.sub(r"#\w+", "", text).strip()
-            if allowed:
-                text = text.rstrip() + "\n\n" + " ".join(allowed)
+
+            tags = []
+
+            # Detect what assets the news is explicitly about
+            is_oil  = any(k in t_lower for k in [
+                "oil", "crude", "opec", "barrel", "brent", "wti",
+                "hormuz", "energy supply", "petroleum"
+            ])
+            is_gold = any(k in t_lower for k in [
+                "gold", "xau", "xauusd", "bullion", "ounce"
+            ])
+            is_usd  = any(k in t_lower for k in [
+                "fed ", "fomc", "powell", "federal reserve", "interest rate",
+                "rate cut", "rate hike", "rate hold", "nfp", "cpi", "gdp",
+                "payroll", "inflation", "dollar", "dxy", "usd", "us economy",
+                "retail sales", "unemployment", "jobless", "pmi", "ism",
+                "trump", "tariff", "us sanction", "treasury"
+            ])
+
+            if is_oil:
+                tags.append("#OIL")
+            if is_gold:
+                tags.append("#XAUUSD")
+            if is_usd:
+                tags.append("#DXY")
+
+            # Fallback — keep AI-chosen tags only if allowed and we found none
+            if not tags:
+                tags = [h for h in found if h in ALLOWED_HASHTAGS]
+
+            if tags:
+                text = text.rstrip() + "\n\n" + " ".join(tags)
 
         data["formatted_text"] = text
 
-    # Hard blocks — post-AI check
+    # Emoji safety net — if AI forgot, add one based on hashtags/content
+    if data.get("approved") and data.get("formatted_text"):
+        first_char = data["formatted_text"][0]
+        # Check if first character is an emoji (non-ASCII)
+        if ord(first_char) < 128:
+            t = data["formatted_text"].lower()
+            if "#oil" in t or "oil" in t or "opec" in t:
+                emoji = "🛢️"
+            elif "#xauusd" in t or "gold" in t or "xau" in t:
+                emoji = "🏆"
+            elif "fomc" in t or "fed " in t or "powell" in t:
+                emoji = "🏦"
+            elif "cpi" in t or "nfp" in t or "gdp" in t or "data" in t:
+                emoji = "📊"
+            elif "trump" in t or "tariff" in t or "🇺🇸" in t:
+                emoji = "🚨"
+            elif "war" in t or "strike" in t or "sanction" in t or "missile" in t:
+                emoji = "🚨"
+            elif "#dxy" in t or "dollar" in t or "usd" in t:
+                emoji = "💵"
+            else:
+                emoji = "🌍"
+            data["formatted_text"] = emoji + " " + data["formatted_text"]
     if data.get("approved"):
         block = _hard_block(data.get("formatted_text", ""))
         if block:
