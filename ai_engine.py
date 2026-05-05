@@ -2,7 +2,8 @@
 ai_engine.py — AXIOM INTEL AI Engine.
 - Gemini primary, Groq fallback with retry.
 - Hard blocks: signals, sentiment, injection. Watermarks stripped silently.
-- Hashtags: #XAUUSD #DXY #OIL only where relevant, no "HASHTAGS:" label.
+- Hashtags: #XAUUSD #DXY #OIL only where relevant — detected from final text, ONE pass.
+- Emoji: picked from final text content, ONE pass, never double-applied.
 - FF calendar: daily once/day, weekly once/week.
 - Geopolitical/FOMC always approved.
 - Same-time events: comma-joined on ONE line.
@@ -51,20 +52,20 @@ def _strip_be_careful(text: str) -> str:
 
 
 def _strip_hashtag_label(text: str) -> str:
-    """Remove any 'HASHTAGS:' or 'HASHTAGS -' label the AI writes."""
     return re.sub(r"HASHTAGS?\s*[:\-]?\s*\n?", "", text, flags=re.IGNORECASE).strip()
 
 
 def _strip_watermarks(text: str) -> str:
-    """Silently remove any @username or t.me/channel links (except our own)."""
-    # Remove t.me/links except Squad_4xx
     text = re.sub(r"t\.me/(?!Squad_4xx)[a-zA-Z0-9_]+", "", text, flags=re.IGNORECASE)
-    # Remove @usernames except @Squad_4xx
     text = re.sub(r"@(?!Squad_4xx)[a-zA-Z0-9_]{4,}", "", text, flags=re.IGNORECASE)
-    # Clean up any leftover double spaces or orphaned punctuation from removal
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _strip_all_hashtags(text: str) -> str:
+    """Remove every #word from text — used before we re-add correct ones."""
+    return re.sub(r"\s*#\w+", "", text).strip()
 
 
 # ── Hard block patterns ───────────────────────────────────────────────────────
@@ -82,11 +83,6 @@ _SENTIMENT_RE = re.compile(
     r"put[/-]call\s*ratio|vix\s*index)\b",
     re.IGNORECASE,
 )
-_WATERMARK_RE = re.compile(
-    r"(t\.me/(?!Squad_4xx)[a-zA-Z0-9_]+|"
-    r"@(?!Squad_4xx)[a-zA-Z0-9_]{4,})",
-    re.IGNORECASE,
-)
 _INJECTION_RE = re.compile(
     r"\b(ignore\s+(all\s+|previous\s+)?rules?|"
     r"ignore\s+(all\s+)?instructions?|system\s*prompt|"
@@ -97,7 +93,6 @@ _INJECTION_RE = re.compile(
 
 
 def _hard_block(text: str) -> Optional[str]:
-    """Returns block reason or None if clean."""
     if not text:
         return None
     if _SIGNAL_RE.search(text):
@@ -107,6 +102,277 @@ def _hard_block(text: str) -> Optional[str]:
     if _INJECTION_RE.search(text):
         return "injection_attempt"
     return None
+
+
+# ── Hashtag engine — single source of truth ───────────────────────────────────
+#
+# HOW IT WORKS:
+# The AI prompt tells the AI NOT to add hashtags.
+# We strip ALL hashtags from AI output.
+# Then this function adds exactly the right ones — one time, here only.
+#
+# RULES:
+# Each asset has a PRIMARY keyword list (news is directly about this asset)
+# and an EXCLUDED keyword list (news mentions the asset only as a side-effect).
+#
+# Example: "Oil drops on Fed rate cut" — Fed is the subject, oil is a side-effect.
+#   → #DXY only, NOT #OIL
+# Example: "OPEC cuts production, oil surges" — oil is the subject.
+#   → #OIL only
+# Example: "Gold hits $3,400 as dollar weakens after Fed cut"
+#   → both #XAUUSD and #DXY because both are explicitly mentioned as subjects.
+
+# Keywords that make this asset the SUBJECT of the news
+_OIL_SUBJECT = [
+    "oil", "crude", "opec", "barrel", "brent", "wti",
+    "hormuz", "energy supply", "petroleum", "gasoline",
+    "oil production", "oil output", "oil prices", "oil market",
+    "energy market", "oil cut", "oil hike", "oil embargo",
+]
+
+# If these appear WITHOUT oil subject words, oil is just a side-effect — skip #OIL
+_OIL_EXCLUDE_IF_ALONE = [
+    "fed", "fomc", "powell", "nfp", "cpi", "gdp", "trump tariff",
+    "interest rate", "gold hits", "dollar", "dxy",
+]
+
+_GOLD_SUBJECT = [
+    "gold", "xau", "xauusd", "bullion",
+    "gold price", "gold hits", "gold surges", "gold drops",
+    "gold rally", "gold falls", "gold ounce", "gold market",
+    "precious metal",
+]
+
+_GOLD_EXCLUDE_IF_ALONE = [
+    "oil", "opec", "barrel", "crude",
+]
+
+# USD/DXY subject: the news is ABOUT the dollar, Fed, or US economic data
+_DXY_SUBJECT = [
+    # Fed / monetary policy
+    "fed ", "fomc", "powell", "federal reserve", "federal funds",
+    "interest rate decision", "rate cut", "rate hike", "rate hold",
+    "rate unchanged", "basis points", "bps",
+    # US economic data releases
+    "nfp", "non-farm payroll", "non-farm employment",
+    "cpi", "consumer price index",
+    "pce", "core pce",
+    "gdp", "gross domestic product",
+    "retail sales",
+    "unemployment rate", "jobless claims",
+    "ism ", "pmi",
+    "durable goods",
+    "average hourly earnings",
+    "jolts",
+    "ism services", "ism manufacturing",
+    # Dollar itself
+    "dollar", "dxy", "usd index", "dollar index",
+    "dollar strength", "dollar weakness", "dollar rallies", "dollar drops",
+    # Tariffs / trade only when explicitly tied to dollar/economy
+    "tariff on", "tariffs on", "trade war", "trade deal",
+    # Trump statements only when explicitly about economy/dollar/rates
+    "trump tax", "trump rate", "trump fed", "trump economy",
+    "trump tariff on", "trump imposes tariff",
+    # US sanctions affecting dollar
+    "us sanctions", "us sanction",
+    # Treasury
+    "us treasury", "treasury yield", "10-year yield", "bond yield",
+]
+
+# These make something look DXY-related but are NOT the subject
+_DXY_EXCLUDE_IF_ALONE = [
+    "oil", "opec", "barrel", "crude",
+    "gold hits", "xau hits",
+]
+
+
+def _detect_assets(text: str) -> list:
+    """
+    Analyse text and return the list of hashtags that should be added.
+    Each asset is only included when the news is DIRECTLY about that asset.
+    Returns e.g. ["#OIL"], ["#DXY", "#XAUUSD"], etc.
+    Never returns random or guessed tags.
+    """
+    t = text.lower()
+    tags = []
+
+    # ── OIL ──────────────────────────────────────────────────────────────────
+    oil_hit = any(kw in t for kw in _OIL_SUBJECT)
+    if oil_hit:
+        # Check it's not just a side-effect mention
+        # e.g. "Fed cuts rates, oil jumps" — oil jumps but Fed is the subject
+        only_side_effect = (
+            not any(kw in t for kw in [
+                "oil production", "oil output", "opec", "barrel",
+                "oil price", "oil market", "oil cut", "oil embargo",
+                "hormuz", "brent", "wti", "crude oil", "petroleum",
+            ])
+            and any(kw in t for kw in _OIL_EXCLUDE_IF_ALONE)
+        )
+        if not only_side_effect:
+            tags.append("#OIL")
+
+    # ── GOLD ─────────────────────────────────────────────────────────────────
+    gold_hit = any(kw in t for kw in _GOLD_SUBJECT)
+    if gold_hit:
+        only_side_effect = (
+            not any(kw in t for kw in [
+                "gold price", "gold hits", "gold surges", "gold drops",
+                "gold rally", "gold falls", "xauusd", "xau/usd",
+                "bullion", "ounce", "precious metal",
+            ])
+            and any(kw in t for kw in _GOLD_EXCLUDE_IF_ALONE)
+        )
+        if not only_side_effect:
+            tags.append("#XAUUSD")
+
+    # ── DXY ──────────────────────────────────────────────────────────────────
+    dxy_hit = any(kw in t for kw in _DXY_SUBJECT)
+    if dxy_hit:
+        only_side_effect = (
+            not any(kw in t for kw in [
+                "fed ", "fomc", "powell", "federal reserve",
+                "interest rate", "rate cut", "rate hike", "rate hold",
+                "nfp", "cpi", "gdp", "pce", "unemployment",
+                "dollar", "dxy", "treasury yield",
+                "tariff on", "tariffs on", "trade war",
+                "retail sales", "jobless", "ism ", "pmi",
+            ])
+            and any(kw in t for kw in _DXY_EXCLUDE_IF_ALONE)
+        )
+        if not only_side_effect:
+            tags.append("#DXY")
+
+    return tags
+
+
+# ── Emoji engine — single source of truth ─────────────────────────────────────
+#
+# HOW IT WORKS:
+# We check the FINAL cleaned text (after watermarks/hashtags stripped).
+# One function, called once, never double-applied.
+# Priority order matters — more specific checks come first.
+
+def _pick_emoji(text: str) -> str:
+    """
+    Pick the single most relevant emoji for this news post.
+    Returns the emoji string (e.g. "🏦").
+    """
+    t = text.lower()
+
+    # Fed / central bank — highest priority for financial news
+    if any(k in t for k in [
+        "fomc", "federal reserve", "fed holds", "fed cuts", "fed raises",
+        "fed hikes", "powell", "federal funds rate", "rate decision",
+        "interest rate decision", "basis points", "bps",
+    ]):
+        return "🏦"
+
+    # Economic data release
+    if any(k in t for k in [
+        "nfp", "non-farm payroll", "non-farm employment",
+        "cpi", "consumer price index",
+        "pce", "core pce",
+        "gdp", "gross domestic product",
+        "retail sales", "unemployment rate", "jobless claims",
+        "ism", "pmi", "durable goods", "jolts",
+        "average hourly earnings", "trade balance",
+        "producer price", "ppi",
+    ]):
+        return "📊"
+
+    # Oil / energy
+    if any(k in t for k in [
+        "oil", "crude", "opec", "barrel", "brent", "wti",
+        "hormuz", "petroleum", "energy supply",
+    ]):
+        return "🛢️"
+
+    # Gold price hit
+    if any(k in t for k in [
+        "gold hits", "gold surges", "gold reaches", "gold at $",
+        "gold record", "xau hits", "xauusd", "gold all time",
+        "gold rallies", "gold jumps",
+    ]):
+        return "🏆"
+
+    # General gold mention
+    if any(k in t for k in ["gold", "xau", "bullion", "precious metal"]):
+        return "🏆"
+
+    # Dollar / DXY
+    if any(k in t for k in [
+        "dollar", "dxy", "usd index", "dollar index",
+        "dollar rallies", "dollar drops", "dollar strength",
+    ]):
+        return "💵"
+
+    # War / geopolitical conflict / sanctions
+    if any(k in t for k in [
+        "war", "missile", "strike", "attack", "bomb",
+        "sanction", "conflict", "troops", "invasion",
+        "nuclear", "explosion", "military",
+    ]):
+        return "🚨"
+
+    # Trump / US political / tariffs
+    if any(k in t for k in [
+        "trump", "tariff", "trade war", "trade deal",
+        "white house", "executive order",
+    ]):
+        return "🇺🇸"
+
+    # Geopolitical — world leaders / tensions
+    if any(k in t for k in [
+        "putin", "xi jinping", "iran", "ukraine", "russia",
+        "nato", "opec", "middle east", "geopolit",
+        "biden", "president", "prime minister",
+    ]):
+        return "🌍"
+
+    # Breaking / urgent — fallback for anything urgent-sounding
+    if any(k in t for k in [
+        "breaking", "urgent", "flash", "just in", "alert",
+        "emergency", "crisis",
+    ]):
+        return "🚨"
+
+    # Default
+    return "🌍"
+
+
+def _apply_emoji_and_hashtags(text: str, is_calendar: bool = False) -> str:
+    """
+    Single pass that:
+    1. Strips ALL existing hashtags from the text
+    2. Checks if first character is already an emoji — if not, prepends one
+    3. Adds correct hashtags at the end (skipped for calendar posts)
+
+    This is the ONLY place emojis and hashtags are added. Never called twice.
+    """
+    if not text:
+        return text
+
+    # Step 1 — strip all hashtags the AI may have added
+    text = _strip_all_hashtags(text)
+    text = text.strip()
+
+    # Step 2 — emoji: check first real character
+    # Walk past leading whitespace to find actual first char
+    first_char = text.lstrip()[0] if text.strip() else ""
+    has_emoji  = first_char and ord(first_char) > 127
+
+    if not has_emoji:
+        emoji = _pick_emoji(text)
+        text  = emoji + " " + text
+
+    # Step 3 — hashtags (calendar posts never get hashtags)
+    if not is_calendar:
+        tags = _detect_assets(text)
+        if tags:
+            text = text.rstrip() + "\n\n" + " ".join(tags)
+
+    return text
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -140,7 +406,7 @@ ALWAYS REJECT:
 8. Sentiment — Fear & Greed, COT, smart money, VIX
 9. Bank sentiment — "banks are bullish/bearish"
 
-NOTE: If content contains another channel username or link — IGNORE it, treat the news itself on its merits.
+NOTE: If content contains another channel username or link — IGNORE it. Judge the news itself.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 REWRITING RULES — CRITICAL:
@@ -162,79 +428,19 @@ DO NOT:
 - Do NOT summarise or shorten — keep ALL original content
 - Do NOT change the meaning of any sentence
 - Do NOT add emojis the source did not have (keep source emojis)
+- Do NOT add hashtags — the system handles hashtags automatically
 
 WRONG — adding prediction not in source:
 Source: "Trump announces 50% tariffs on EU"
-Bad output: "Trump announces 50% tariffs on EU. This could spark a trade war and hurt global growth."
-→ The second sentence was invented. NEVER do this.
+Bad output: "Trump announces 50% tariffs on EU. This could spark a trade war."
+→ NEVER invent sentences. Keep it exactly as source.
 
-CORRECT — minimal change:
+CORRECT:
 Source: "Trump announces 50% tariffs on EU goods starting June"
 Good output: "Trump announces 50% tariffs on EU goods starting June"
-→ Kept exactly. Only watermark removed if present.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-HASHTAG RULES — EXACT MATCH ONLY:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-One hashtag per asset. Only use the hashtag for the asset the news is DIRECTLY about.
-
-#OIL    → news is about Oil, crude, OPEC, energy supply, Hormuz
-#XAUUSD → news is about Gold, XAU price
-#DXY    → news is about USD, Dollar, Fed, FOMC, US interest rates, US economic data
-
-STRICT ONE-ASSET RULE:
-- Oil news → #OIL only. Nothing else.
-- Gold news → #XAUUSD only. Nothing else.
-- Fed/USD/data news → #DXY only. Nothing else.
-
-ONLY use multiple hashtags when the news EXPLICITLY mentions multiple assets BY NAME:
-- "Oil drops, Gold surges on Middle East tension" → #OIL #XAUUSD
-- "Fed rate cut sends Gold higher and Dollar lower" → #DXY #XAUUSD
-- "OPEC cut drives Oil and Gold rally" → #OIL #XAUUSD
-- Never guess or assume impact — only what is written in the news
-
-EXAMPLES:
-"OPEC cuts production by 500K barrels" → #OIL
-"Gold hits $3,400 all time high" → #XAUUSD
-"Fed holds rates at 4.5%" → #DXY
-"NFP came at 177K" → #DXY
-"Trump announces 50% EU tariffs" → #DXY
-"Iranian strike hits Hormuz oil tanker" → #OIL
-"Oil drops, Gold and Dollar rally on Fed news" → #OIL #XAUUSD #DXY
-
-NEVER:
-- Never add #DXY to oil news just because oil affects the dollar
-- Never add #XAUUSD to oil news just because gold moves with oil
-- Never add #OIL to Fed news just because rates affect energy
-- Never use any hashtag not in this list: #OIL #XAUUSD #DXY
-- Never write "HASHTAGS:" label — just the tags on one line at the end
-
-EMOJI RULES — REQUIRED:
-- ALWAYS start the post with an emoji — never post without one
-- If source already has an emoji → keep it exactly, use it as the first character
-- If source has NO emoji → pick the most relevant one from this list:
-  🚨 breaking/urgent news
-  🌍 geopolitical / world event
-  📊 economic data release
-  🏦 central bank / Fed / FOMC
-  🛢️ oil / energy / OPEC
-  🏆 gold / XAU hitting level
-  💵 dollar / DXY
-  ⚠️ warning / risk event
-  🗳️ political / election
-  🇺🇸 US specific news / Trump
-
-MATCHING GUIDE:
-- War / strike / sanctions → 🚨
-- FOMC / Fed / Powell → 🏦
-- NFP / CPI / GDP / data → 📊
-- Oil / OPEC / Hormuz → 🛢️
-- Gold price hit → 🏆
-- Trump / tariffs / trade → 🚨 or 🇺🇸
-- Dollar strength/weakness → 💵
-- Geopolitical tension → 🌍
-
-DO NOT add signature. DO NOT add year. NO asterisks. NO bold.
+DO NOT ADD SIGNATURE. DO NOT ADD YEAR. NO ASTERISKS. NO BOLD.
+DO NOT ADD HASHTAGS — they are added automatically by the system.
 
 RESPOND WITH VALID JSON ONLY:
 {"approved": true/false, "reason": "...", "issues": [], "formatted_text": "...", "confidence": 0.9}
@@ -296,7 +502,7 @@ TASK:
    - Time: 12-hour AM/PM, NO leading zero (3:30 PM not 03:30 PM)
    - NO forecast, NO previous, NO hashtags, NO "Be careful", NO signature
 
-EXACT FORMAT EXAMPLE (matches real FF calendar structure):
+EXACT FORMAT EXAMPLE:
 WEEKLY HIGH IMPACT NEWS
 Week of May 5 – May 9
 
@@ -337,26 +543,8 @@ Your job: decide if Story A and Story B are reporting the SAME real-world event.
 
 RULES:
 - Same event = same entity + same action + same context (even if worded differently)
-- Different wording, different source, different language = still SAME if the core fact is identical
+- Different wording, different source = still SAME if core fact is identical
 - Similar topic but different specific event = NOT same
-- If images are provided, compare visual content too (headlines, numbers, screenshots)
-
-EXAMPLES OF SAME (mark true):
-  A: "Trump announces 50% tariffs on EU"
-  B: "White House confirms 50 percent EU tariff"  → same_story: true
-
-  A: "Fed holds rates at 4.5%"
-  B: "FOMC keeps interest rate unchanged at 4.25-4.50"  → same_story: true
-
-  A: "Gold hits $3,400"
-  B: "XAU/USD reaches 3400 for first time"  → same_story: true
-
-EXAMPLES OF DIFFERENT (mark false):
-  A: "Trump threatens EU tariffs"
-  B: "Trump signs China tariff deal"  → same_story: false (different target)
-
-  A: "Fed holds rates May 2025"
-  B: "Fed holds rates March 2025"  → same_story: false (different meeting)
 
 Story A: {story_a}
 Story B: {story_b}
@@ -369,16 +557,13 @@ Respond ONLY with JSON:
 _SIMILARITY_IMAGE_PROMPT = """
 You are a strict duplicate news detector for a financial news channel.
 
-Two news posts are shown — they may be text, images, or both.
-Decide if they report the SAME real-world event.
-
 Story A text: {story_a}
 Story B text: {story_b}
 
-Also examine any images provided carefully — compare headlines, numbers, tickers shown.
+Also examine any images provided — compare headlines, numbers, tickers shown.
 
-SAME = same entity + same action + same core fact (even if worded differently or from different sources)
-NOT SAME = similar topic but different specific event, different date, different country
+SAME = same entity + same action + same core fact
+NOT SAME = similar topic but different event, different date, different country
 
 Be STRICT. Only mark true if genuinely the same event.
 Respond ONLY with JSON:
@@ -386,7 +571,7 @@ Respond ONLY with JSON:
 """
 
 
-# ── Be-careful lines for reminders ────────────────────────────────────────────
+# ── Be-careful lines ──────────────────────────────────────────────────────────
 def _get_be_careful_line(event_name: str) -> str:
     n = event_name.lower()
     if any(k in n for k in ["fomc", "federal funds", "interest rate", "fed chair", "powell"]):
@@ -443,6 +628,11 @@ def _parse_json(raw: str) -> dict:
 
 
 def _validate_and_clean(data: dict) -> dict:
+    """
+    Clean the raw AI JSON response.
+    Does NOT add emoji or hashtags here — that happens in _build_post_body
+    and _apply_emoji_and_hashtags so it only ever runs once.
+    """
     data.setdefault("approved", False)
     data.setdefault("reason", "")
     data.setdefault("issues", [])
@@ -456,73 +646,11 @@ def _validate_and_clean(data: dict) -> dict:
         text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text)
         text = _strip_be_careful(text)
         text = _strip_hashtag_label(text)
-
-        # Calendar posts — strip ALL hashtags
-        if text.startswith("TODAY'S USD") or text.startswith("WEEKLY HIGH IMPACT"):
-            text = re.sub(r"#\w+", "", text).strip()
-        # Regular news — exact asset hashtag matching
-        else:
-            t_lower = text.lower()
-            found   = re.findall(r"#\w+", text)
-            text    = re.sub(r"#\w+", "", text).strip()
-
-            tags = []
-
-            # Detect what assets the news is explicitly about
-            is_oil  = any(k in t_lower for k in [
-                "oil", "crude", "opec", "barrel", "brent", "wti",
-                "hormuz", "energy supply", "petroleum"
-            ])
-            is_gold = any(k in t_lower for k in [
-                "gold", "xau", "xauusd", "bullion", "ounce"
-            ])
-            is_usd  = any(k in t_lower for k in [
-                "fed ", "fomc", "powell", "federal reserve", "interest rate",
-                "rate cut", "rate hike", "rate hold", "nfp", "cpi", "gdp",
-                "payroll", "inflation", "dollar", "dxy", "usd", "us economy",
-                "retail sales", "unemployment", "jobless", "pmi", "ism",
-                "trump", "tariff", "us sanction", "treasury"
-            ])
-
-            if is_oil:
-                tags.append("#OIL")
-            if is_gold:
-                tags.append("#XAUUSD")
-            if is_usd:
-                tags.append("#DXY")
-
-            # Fallback — keep AI-chosen tags only if allowed and we found none
-            if not tags:
-                tags = [h for h in found if h in ALLOWED_HASHTAGS]
-
-            if tags:
-                text = text.rstrip() + "\n\n" + " ".join(tags)
-
+        # Clean up extra blank lines
+        text = re.sub(r"\n\s*\n", "\n\n", text).strip()
         data["formatted_text"] = text
 
-    # Emoji safety net — if AI forgot, add one based on hashtags/content
-    if data.get("approved") and data.get("formatted_text"):
-        first_char = data["formatted_text"][0]
-        # Check if first character is an emoji (non-ASCII)
-        if ord(first_char) < 128:
-            t = data["formatted_text"].lower()
-            if "#oil" in t or "oil" in t or "opec" in t:
-                emoji = "🛢️"
-            elif "#xauusd" in t or "gold" in t or "xau" in t:
-                emoji = "🏆"
-            elif "fomc" in t or "fed " in t or "powell" in t:
-                emoji = "🏦"
-            elif "cpi" in t or "nfp" in t or "gdp" in t or "data" in t:
-                emoji = "📊"
-            elif "trump" in t or "tariff" in t or "🇺🇸" in t:
-                emoji = "🚨"
-            elif "war" in t or "strike" in t or "sanction" in t or "missile" in t:
-                emoji = "🚨"
-            elif "#dxy" in t or "dollar" in t or "usd" in t:
-                emoji = "💵"
-            else:
-                emoji = "🌍"
-            data["formatted_text"] = emoji + " " + data["formatted_text"]
+    # Hard block check on cleaned text
     if data.get("approved"):
         block = _hard_block(data.get("formatted_text", ""))
         if block:
@@ -545,7 +673,12 @@ def _reject(reason: str, issue: str, confidence: float = 1.0) -> dict:
     }
 
 
-def _build_post_body(text: str) -> str:
+def _build_post_body(text: str, is_calendar: bool = False) -> str:
+    """
+    Final post assembly — called ONCE per approved post.
+    Order: clean → emoji + hashtags → US flag → signature.
+    Emoji and hashtags are added here and NOWHERE else.
+    """
     if not text:
         return ""
     text = text.replace("*", "")
@@ -559,7 +692,18 @@ def _build_post_body(text: str) -> str:
         lines[i] = re.sub(r"\b\d{4}\b", "", lines[i])
     text = "\n".join(lines)
     text = re.sub(r"\n\s*\n", "\n\n", text).strip()
-    return _add_signature(text)
+
+    # ── Single pass: emoji + hashtags ─────────────────────────────────────────
+    text = _apply_emoji_and_hashtags(text, is_calendar=is_calendar)
+
+    # ── US flag on USD mentions in first line (after emoji applied) ───────────
+    if not is_calendar:
+        text = _add_us_flag(text)
+
+    # ── Signature ─────────────────────────────────────────────────────────────
+    text = _add_signature(text)
+
+    return text
 
 
 # ── AIEngine class ────────────────────────────────────────────────────────────
@@ -583,7 +727,6 @@ class AIEngine:
                 temperature=0.2, max_output_tokens=1200
             ),
         )
-        # No response_mime_type on vision — causes conflicts with image prompts
         self._gemini_vision = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             generation_config=genai.GenerationConfig(
@@ -596,9 +739,7 @@ class AIEngine:
     async def analyse(self, text: str, image_data: Optional[bytes] = None,
                       image_mime: str = "image/jpeg") -> dict:
 
-        # Pre-filter source text before AI — saves quota
         if text:
-            # Strip watermarks silently before AI sees the text
             text = _strip_watermarks(text)
             if _SENTIMENT_RE.search(text):
                 return _reject("Sentiment indicator blocked", "sentiment_content")
@@ -616,10 +757,10 @@ class AIEngine:
             If real geopolitical/macro news OR actual released data OR price level hit → approve.
             If forecast/previous only/signal/TA/chart/meme/sentiment/stale → reject.
 
-            IMPORTANT: If approved, copy the source text with MINIMAL changes only.
+            IMPORTANT: If approved, copy source text with MINIMAL changes only.
             Do NOT rewrite. Do NOT add sentences. Do NOT add predictions or context.
             Only remove watermarks. Fix grammar only if clearly wrong. Keep all numbers exact.
-            Return JSON.
+            Do NOT add hashtags — system handles them. Return JSON.
         """).strip()
 
         # Try Gemini with one retry
@@ -630,9 +771,9 @@ class AIEngine:
                 )
                 verdict["engine"] = "gemini-2.5-flash"
                 if verdict.get("approved") and verdict.get("formatted_text"):
-                    verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
-                    if not verdict["formatted_text"].startswith("TODAY'S USD"):
-                        verdict["formatted_text"] = _add_us_flag(verdict["formatted_text"])
+                    verdict["formatted_text"] = _build_post_body(
+                        verdict["formatted_text"], is_calendar=False
+                    )
                 return verdict
             except asyncio.TimeoutError:
                 if attempt == 0:
@@ -649,9 +790,9 @@ class AIEngine:
             )
             verdict["engine"] = "groq-llama4-scout"
             if verdict.get("approved") and verdict.get("formatted_text"):
-                verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
-                if not verdict["formatted_text"].startswith("TODAY'S USD"):
-                    verdict["formatted_text"] = _add_us_flag(verdict["formatted_text"])
+                verdict["formatted_text"] = _build_post_body(
+                    verdict["formatted_text"], is_calendar=False
+                )
             return verdict
         except Exception:
             return _reject("Both AI engines unavailable", "engine_error", confidence=0.0)
@@ -659,10 +800,6 @@ class AIEngine:
     # ── FF image detection ────────────────────────────────────────────────────
 
     async def detect_ff_image(self, image_data: bytes, image_mime: str) -> tuple:
-        """
-        Returns (is_ff: bool, is_weekly: bool).
-        Single AI call — detects both FF calendar and weekly/daily.
-        """
         try:
             parts = [
                 {"inline_data": {"mime_type": image_mime, "data": _b64(image_data)}},
@@ -696,7 +833,6 @@ class AIEngine:
             prompt,
         ]
 
-        # Gemini with retry
         for attempt in range(2):
             try:
                 loop = asyncio.get_running_loop()
@@ -708,7 +844,10 @@ class AIEngine:
                 )
                 data = _parse_json(resp.text)
                 if data.get("approved") and data.get("formatted_text"):
-                    data["formatted_text"] = _add_us_flag(data["formatted_text"])
+                    # Calendar posts: emoji added but NO hashtags
+                    data["formatted_text"] = _build_post_body(
+                        data["formatted_text"], is_calendar=True
+                    )
                 return data
             except asyncio.TimeoutError:
                 if attempt == 0:
@@ -735,7 +874,9 @@ class AIEngine:
             )
             data = _parse_json(resp.choices[0].message.content)
             if data.get("approved") and data.get("formatted_text"):
-                data["formatted_text"] = _add_us_flag(data["formatted_text"])
+                data["formatted_text"] = _build_post_body(
+                    data["formatted_text"], is_calendar=True
+                )
             return data
         except Exception:
             return {"approved": False, "reason": "AI engines unavailable for image analysis."}
@@ -745,60 +886,40 @@ class AIEngine:
     async def is_same_story(self, text_a: str, text_b: str,
                             image_a: Optional[bytes] = None,
                             image_b: Optional[bytes] = None) -> bool:
-        """
-        Multi-layer duplicate detection.
-        Layer 1: Fast keyword hash — no AI, instant.
-        Layer 2: Gemini vision — both images + both texts.
-        Layer 3: Groq fallback — both images + both texts.
-        Confidence threshold: 0.75 (strict).
-        """
-
-        # ── Normalise text ────────────────────────────────────────────────────
         def _normalise(t: str) -> str:
             if not t:
                 return ""
             t = t.lower()
             t = _strip_watermarks(t)
-            t = re.sub(r"[^\w\s]", " ", t)   # strip punctuation
+            t = re.sub(r"[^\w\s]", " ", t)
             t = re.sub(r"\s+", " ", t).strip()
             return t
 
         norm_a = _normalise(text_a)
         norm_b = _normalise(text_b)
 
-        # ── Layer 1a: Exact hash match (text only, instant) ───────────────────
         if norm_a and norm_b and norm_a == norm_b:
-            log.info("Duplicate detected: exact text match")
             return True
 
-        # ── Layer 1b: Key phrase overlap (fast, no AI) ────────────────────────
         if norm_a and norm_b:
-            words_a = set(norm_a.split())
-            words_b = set(norm_b.split())
-            # Remove common stop words
             stops = {
                 "the","a","an","is","are","was","were","in","on","at","to",
                 "of","and","or","for","with","as","by","from","that","this",
                 "it","its","be","been","has","have","had","will","said","says"
             }
-            keys_a = words_a - stops
-            keys_b = words_b - stops
+            keys_a = set(norm_a.split()) - stops
+            keys_b = set(norm_b.split()) - stops
             if keys_a and keys_b:
                 overlap = len(keys_a & keys_b) / min(len(keys_a), len(keys_b))
                 if overlap >= 0.80:
-                    log.info(f"Duplicate detected: keyword overlap {overlap:.0%}")
                     return True
-                # Very low overlap + no images = definitely not same
                 if overlap < 0.10 and not image_a and not image_b:
-                    log.info(f"Not duplicate: keyword overlap too low {overlap:.0%}")
                     return False
 
-        # ── Layer 1c: Image-only posts — don't skip, send to AI ───────────────
         has_content = norm_a or norm_b or image_a or image_b
         if not has_content:
             return False
 
-        # ── Build prompts ─────────────────────────────────────────────────────
         has_images = image_a or image_b
         prompt = (
             _SIMILARITY_IMAGE_PROMPT if has_images else _SIMILARITY_PROMPT
@@ -807,17 +928,13 @@ class AIEngine:
             story_b=(norm_b[:800] if norm_b else "(image only)"),
         )
 
-        # ── Layer 2: Gemini vision — both images ──────────────────────────────
+        # Gemini
         try:
             parts = []
             if image_a:
-                parts.append({
-                    "inline_data": {"mime_type": "image/jpeg", "data": _b64(image_a)}
-                })
+                parts.append({"inline_data": {"mime_type": "image/jpeg", "data": _b64(image_a)}})
             if image_b:
-                parts.append({
-                    "inline_data": {"mime_type": "image/jpeg", "data": _b64(image_b)}
-                })
+                parts.append({"inline_data": {"mime_type": "image/jpeg", "data": _b64(image_b)}})
             parts.append(prompt)
 
             loop = asyncio.get_running_loop()
@@ -827,34 +944,25 @@ class AIEngine:
                 ),
                 timeout=25,
             )
-            data = _parse_json(resp.text)
+            data       = _parse_json(resp.text)
             confidence = data.get("confidence", 0)
-            same = bool(data.get("same_story", False))
-            log.info(
-                f"Gemini similarity: same={same} confidence={confidence:.2f} "
-                f"reason={data.get('reason', '')}"
-            )
+            same       = bool(data.get("same_story", False))
             if same and confidence >= 0.75:
                 return True
             if not same and confidence >= 0.75:
                 return False
-            # Low confidence — fall through to Groq for second opinion
         except Exception as e:
             log.warning(f"Gemini similarity failed: {e}")
 
-        # ── Layer 3: Groq fallback — both images via base64 url ───────────────
+        # Groq fallback
         try:
             content: list = []
             if image_a:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{_b64(image_a)}"},
-                })
+                content.append({"type": "image_url",
+                                 "image_url": {"url": f"data:image/jpeg;base64,{_b64(image_a)}"}})
             if image_b:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{_b64(image_b)}"},
-                })
+                content.append({"type": "image_url",
+                                 "image_url": {"url": f"data:image/jpeg;base64,{_b64(image_b)}"}})
             content.append({"type": "text", "text": prompt})
 
             resp = await asyncio.wait_for(
@@ -866,18 +974,12 @@ class AIEngine:
                 ),
                 timeout=30,
             )
-            data = _parse_json(resp.choices[0].message.content)
+            data       = _parse_json(resp.choices[0].message.content)
             confidence = data.get("confidence", 0)
-            same = bool(data.get("same_story", False))
-            log.info(
-                f"Groq similarity: same={same} confidence={confidence:.2f} "
-                f"reason={data.get('reason', '')}"
-            )
+            same       = bool(data.get("same_story", False))
             return same and confidence >= 0.75
         except Exception as e:
             log.warning(f"Groq similarity failed: {e}")
-            # Both engines failed — safe default: treat as NOT duplicate
-            # (better to post a duplicate than block real news)
             return False
 
     async def get_be_careful_line(self, event_name: str) -> str:
