@@ -1,7 +1,8 @@
 """
-ai_engine.py — AXIOM INTEL AI Engine.
+ai_engine.py — AXIOM INTEL AI Engine (FIXED for geopolitical news).
 - Gemini primary, Groq fallback with retry.
 - Hard blocks: signals, sentiment, watermark, injection.
+- Geopolitical / leader statements get exemption from signal/sentiment blocks.
 - Hashtags: #XAUUSD #DXY #OIL only where relevant.
 - FF calendar: daily once/day, weekly once/week.
 - Geopolitical/FOMC always approved.
@@ -15,7 +16,7 @@ import random
 import re
 import textwrap
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 import google.generativeai as genai
 from groq import AsyncGroq
@@ -23,8 +24,15 @@ from groq import AsyncGroq
 log = logging.getLogger("ai_engine")
 
 CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
-ALLOWED_HASHTAGS  = {"#XAUUSD", "#DXY", "#OIL"}
+ALLOWED_HASHTAGS = {"#XAUUSD", "#DXY", "#OIL"}
 
+# ── Geopolitical keywords to exempt from hard blocks ─────────────────────────
+GEOPOLITICAL_KEYWORDS = re.compile(
+    r"\b(trump|putin|xi|kim|netanyahu|zelensky|modi|macron|scholz|"
+    r"war|missile|strike|sanctions|hormuz|tariff|trade war|"
+    r"president|prime minister|chancellor|secretary of state)\b",
+    re.IGNORECASE,
+)
 
 # ── Signature ─────────────────────────────────────────────────────────────────
 def _add_signature(text: str) -> str:
@@ -36,7 +44,6 @@ def _add_signature(text: str) -> str:
             text += "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
     return text
 
-
 def _add_us_flag(text: str) -> str:
     if not text:
         return text
@@ -44,10 +51,8 @@ def _add_us_flag(text: str) -> str:
     lines[0] = re.sub(r"\bUSD\b", "USD 🇺🇸", lines[0], count=1)
     return "\n".join(lines)
 
-
 def _strip_be_careful(text: str) -> str:
     return re.sub(r"\n?Be careful[^\n]*\n?", "", text, flags=re.IGNORECASE).strip()
-
 
 # ── Hard block patterns ───────────────────────────────────────────────────────
 _SIGNAL_RE = re.compile(
@@ -77,23 +82,25 @@ _INJECTION_RE = re.compile(
     re.IGNORECASE,
 )
 
-
-def _hard_block(text: str) -> Optional[str]:
-    """Returns block reason or None if clean."""
+def _hard_block(text: str, is_geopolitical: bool = False) -> Optional[str]:
+    """
+    Returns block reason or None if clean.
+    If is_geopolitical is True, signal/sentiment blocks are skipped.
+    """
     if not text:
         return None
-    if _SIGNAL_RE.search(text):
-        return "signal_content"
-    if _SENTIMENT_RE.search(text):
-        return "sentiment_content"
+    if not is_geopolitical:
+        if _SIGNAL_RE.search(text):
+            return "signal_content"
+        if _SENTIMENT_RE.search(text):
+            return "sentiment_content"
     if _WATERMARK_RE.search(text):
         return "watermark_content"
     if _INJECTION_RE.search(text):
         return "injection_attempt"
     return None
 
-
-# ── System prompt ─────────────────────────────────────────────────────────────
+# ── System prompt (improved for geopolitical news) ────────────────────────────
 _SYSTEM_PROMPT = """
 You are AXIOM INTEL — Senior Institutional Macro & Geopolitical news editor.
 
@@ -102,6 +109,8 @@ ONLY THESE TOPICS ARE ALLOWED:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. Geopolitical events — war, missile, strike, sanctions, Hormuz, Trump, Putin, Xi
 2. World leader statements affecting Oil, Gold, USD, tariffs, trade
+   → This includes tweets/statements from Presidents, PMs, Chancellors.
+   → Even if they contain words like "buy", "sell", "will go up/down" — as long as it's a political statement, ACCEPT.
 3. FOMC / Fed decisions — rate held, cut, raised (any bps)
 4. Fed Chair Powell speaking
 5. Released economic data with real numbers — CPI, NFP, GDP, PCE, bps
@@ -114,14 +123,14 @@ EVERYTHING ELSE → REJECT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ALWAYS REJECT:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. Signals — Buy/Sell/Long/Short/Entry/TP/SL
+1. Trading signals — Buy/Sell/Long/Short/Entry/TP/SL that are clearly from a trading analyst, not a world leader.
 2. Technical analysis — support/resistance/RSI/MACD/patterns
 3. Chart screenshots with TA drawings
 4. Memes, jokes, informal content
 5. Another channel watermark or username
 6. Content older than 18 hours
-7. Forecast/Previous values — "forecast 180K", "previous 2.3%"
-8. Opinions — "I think", "expect", "my analysis", "I believe"
+7. Forecast/Previous values — "forecast 180K", "previous 2.3%" (only strip them, don't reject)
+8. Opinions that are not from a world leader — "I think", "expect", "my analysis"
 9. Sentiment — Fear & Greed, COT, smart money, VIX
 10. Bank sentiment — "banks are bullish/bearish"
 11. Off-topic — anything not in the allowed list above
@@ -137,7 +146,7 @@ RULES:
 3. DO NOT add predictions, analysis, or explanations
 4. DO NOT paraphrase or rewrite anything
 5. DO NOT summarize — use the full original text
-6. ONLY remove: forecast values, previous values, signals, watermarks
+6. ONLY remove: forecast values, previous values, signals (only if clearly trading signals, not leader statements), watermarks
 7. ONLY fix: obvious spelling mistakes
 8. Add ONE emoji at the very start of the first line
 9. Add relevant hashtags at the very end only
@@ -163,6 +172,7 @@ EMOJI — pick based on content:
 💵 = dollar/USD/DXY move
 ⚠️ = warning/risk event
 🗳️ = political/election
+💬 = statement from a leader / Trump tweet
 
 HASHTAGS — only if news directly moves that market price:
 #XAUUSD = gold price affected
@@ -176,8 +186,7 @@ RESPOND WITH VALID JSON ONLY:
 {"approved": true/false, "reason": "...", "issues": [], "formatted_text": "...", "confidence": 0.9}
 """.strip()
 
-
-# ── ForexFactory prompts ──────────────────────────────────────────────────────
+# ── ForexFactory prompts (unchanged but improved JSON handling) ───────────────
 _FF_DAILY_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
@@ -272,7 +281,6 @@ Be aggressive — if any reasonable chance they are same, mark true.
 JSON: {{"same_story": true/false, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-
 # ── Be-careful lines for reminders ────────────────────────────────────────────
 def _get_be_careful_line(event_name: str) -> str:
     n = event_name.lower()
@@ -298,16 +306,13 @@ def _get_be_careful_line(event_name: str) -> str:
         return "⚠️ Durable Goods can cause sharp moves. Be careful — no new entries now."
     return "⚠️ This release can move the market strongly. Be careful — protect your capital."
 
-
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
-
 
 def _today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-
-# ── JSON parsing ──────────────────────────────────────────────────────────────
+# ── JSON parsing (robust) ─────────────────────────────────────────────────────
 def _parse_json(raw: str) -> dict:
     if not raw:
         raise ValueError("Empty AI response")
@@ -328,7 +333,6 @@ def _parse_json(raw: str) -> dict:
             pass
     raise ValueError(f"No valid JSON in AI response: {raw[:200]}")
 
-
 def _validate_and_clean(data: dict) -> dict:
     data.setdefault("approved", False)
     data.setdefault("reason", "")
@@ -347,36 +351,36 @@ def _validate_and_clean(data: dict) -> dict:
             text = re.sub(r"#\w+", "", text).strip()
         else:
             # Regular news — keep only allowed hashtags
-            found    = re.findall(r"#\w+", text)
-            allowed  = [h for h in found if h in ALLOWED_HASHTAGS]
-            text     = re.sub(r"#\w+", "", text).strip()
+            found = re.findall(r"#\w+", text)
+            allowed = [h for h in found if h in ALLOWED_HASHTAGS]
+            text = re.sub(r"#\w+", "", text).strip()
             if allowed:
                 text = text.rstrip() + "\n\n" + " ".join(allowed)
 
         data["formatted_text"] = text
 
-    # Hard blocks — post-AI check
+    # Hard blocks — post-AI check (geopolitical exemption is applied later)
     if data.get("approved"):
-        block = _hard_block(data.get("formatted_text", ""))
+        # Determine if the content is geopolitical
+        is_geo = bool(GEOPOLITICAL_KEYWORDS.search(data.get("formatted_text", "")))
+        block = _hard_block(data.get("formatted_text", ""), is_geopolitical=is_geo)
         if block:
-            data["approved"]       = False
-            data["reason"]         = f"Hard blocked: {block}"
+            data["approved"] = False
+            data["reason"] = f"Hard blocked: {block}"
             data["issues"].append(block)
             data["formatted_text"] = ""
 
     return data
 
-
 def _reject(reason: str, issue: str, confidence: float = 1.0) -> dict:
     return {
-        "approved":       False,
-        "reason":         reason,
-        "issues":         [issue],
+        "approved": False,
+        "reason": reason,
+        "issues": [issue],
         "formatted_text": "",
-        "confidence":     confidence,
-        "engine":         "pre_filter",
+        "confidence": confidence,
+        "engine": "pre_filter",
     }
-
 
 def _build_post_body(text: str) -> str:
     if not text:
@@ -392,8 +396,7 @@ def _build_post_body(text: str) -> str:
     text = re.sub(r"\n\s*\n", "\n\n", text).strip()
     return _add_signature(text)
 
-
-# ── AIEngine class ────────────────────────────────────────────────────────────
+# ── AIEngine class (fixed) ────────────────────────────────────────────────────
 class AIEngine:
     def __init__(self, gemini_key: str, groq_key: str, channel_category: str):
         self._category = channel_category
@@ -414,7 +417,6 @@ class AIEngine:
                 temperature=0.2, max_output_tokens=1200
             ),
         )
-        # No response_mime_type on vision — causes conflicts with image prompts
         self._gemini_vision = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             generation_config=genai.GenerationConfig(
@@ -422,19 +424,18 @@ class AIEngine:
             ),
         )
 
-    # ── Main analyse ──────────────────────────────────────────────────────────
-
+    # ── Main analyse (with geopolitical exemption in pre-filter) ──────────────
     async def analyse(self, text: str, image_data: Optional[bytes] = None,
                       image_mime: str = "image/jpeg") -> dict:
 
-        # Pre-filter source text before AI — saves quota
+        # Determine if this is likely geopolitical (based on text or image later)
+        is_geopolitical = bool(GEOPOLITICAL_KEYWORDS.search(text)) if text else False
+
+        # Pre-filter source text before AI — with exemption for geopolitical
         if text:
-            if _SENTIMENT_RE.search(text):
-                return _reject("Sentiment indicator blocked", "sentiment_content")
-            if _INJECTION_RE.search(text):
-                return _reject("Prompt injection blocked", "injection_attempt")
-            if _WATERMARK_RE.search(text):
-                return _reject("Watermark blocked", "watermark_content")
+            block = _hard_block(text, is_geopolitical=is_geopolitical)
+            if block:
+                return _reject(f"Hard blocked: {block}", block)
 
         prompt = textwrap.dedent(f"""
             DATE (UTC): {_today_str()}
@@ -465,11 +466,13 @@ class AIEngine:
                         verdict["formatted_text"] = _add_us_flag(verdict["formatted_text"])
                 return verdict
             except asyncio.TimeoutError:
+                log.warning("Gemini timeout, retrying...")
                 if attempt == 0:
                     await asyncio.sleep(3)
                     continue
                 break
-            except Exception:
+            except Exception as e:
+                log.exception("Gemini error: %s", e)
                 break
 
         # Groq fallback
@@ -483,16 +486,12 @@ class AIEngine:
                 if not verdict["formatted_text"].startswith("TODAY'S USD"):
                     verdict["formatted_text"] = _add_us_flag(verdict["formatted_text"])
             return verdict
-        except Exception:
+        except Exception as e:
+            log.exception("Groq fallback error: %s", e)
             return _reject("Both AI engines unavailable", "engine_error", confidence=0.0)
 
-    # ── FF image detection ────────────────────────────────────────────────────
-
-    async def detect_ff_image(self, image_data: bytes, image_mime: str) -> tuple:
-        """
-        Returns (is_ff: bool, is_weekly: bool).
-        Single AI call — detects both FF calendar and weekly/daily.
-        """
+    # ── FF image detection (unchanged) ────────────────────────────────────────
+    async def detect_ff_image(self, image_data: bytes, image_mime: str) -> Tuple[bool, bool]:
         try:
             parts = [
                 {"inline_data": {"mime_type": image_mime, "data": _b64(image_data)}},
@@ -505,14 +504,13 @@ class AIEngine:
                 ),
                 timeout=30
             )
-            raw  = re.sub(r"```+(?:json)?", "", resp.text).strip()
+            raw = re.sub(r"```+(?:json)?", "", resp.text).strip()
             data = json.loads(raw)
             return bool(data.get("is_ff", False)), bool(data.get("is_weekly", False))
         except Exception:
             return False, False
 
-    # ── FF image analysis ─────────────────────────────────────────────────────
-
+    # ── FF image analysis (unchanged) ─────────────────────────────────────────
     async def analyse_ff_image(self, image_data: bytes, image_mime: str,
                                today_date: str, is_weekly: bool = False,
                                week_range: str = "") -> dict:
@@ -526,7 +524,6 @@ class AIEngine:
             prompt,
         ]
 
-        # Gemini with retry
         for attempt in range(2):
             try:
                 loop = asyncio.get_running_loop()
@@ -571,7 +568,6 @@ class AIEngine:
             return {"approved": False, "reason": "AI engines unavailable for image analysis."}
 
     # ── Similarity check ──────────────────────────────────────────────────────
-
     async def is_same_story(self, text_a: str, text_b: str,
                             image_a: Optional[bytes] = None,
                             image_b: Optional[bytes] = None) -> bool:
@@ -581,7 +577,6 @@ class AIEngine:
             story_a=(text_a[:500] if text_a else ""),
             story_b=(text_b[:500] if text_b else ""),
         )
-        # Try Gemini
         try:
             parts = []
             if image_a:
@@ -597,13 +592,9 @@ class AIEngine:
             data = _parse_json(resp.text)
             same = bool(data.get("same_story", False))
             conf = data.get("confidence", 0)
-            # Hard threshold: 0.45 — more aggressive duplicate blocking
-            # Source A says "Fed holds rates" Source B says "FOMC keeps rate unchanged"
-            # Both should be blocked as same story
             return same and conf >= 0.45
         except Exception:
             pass
-        # Groq fallback
         try:
             resp = await asyncio.wait_for(
                 self._groq.chat.completions.create(
@@ -624,7 +615,6 @@ class AIEngine:
         return _get_be_careful_line(event_name)
 
     # ── Internal calls ────────────────────────────────────────────────────────
-
     async def _gemini_call(self, prompt: str, image_data: Optional[bytes],
                            image_mime: str) -> dict:
         parts = []
@@ -650,7 +640,7 @@ class AIEngine:
             model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user",   "content": content},
+                {"role": "user", "content": content},
             ],
             temperature=0.15, max_tokens=600,
         )
@@ -658,9 +648,9 @@ class AIEngine:
 
     @staticmethod
     def _fallback_alert(event: dict, minutes_left: int) -> str:
-        emoji      = "🔴" if event.get("impact") == "red" else "🟠"
+        emoji = "🔴" if event.get("impact") == "red" else "🟠"
         event_name = event.get("name", "Unknown Event")
-        line       = _get_be_careful_line(event_name)
+        line = _get_be_careful_line(event_name)
         text = (
             f"🚨 ALERT: {minutes_left} MINUTES REMAINING\n\n"
             f"{emoji} {event_name}\n"
