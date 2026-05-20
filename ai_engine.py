@@ -8,6 +8,12 @@ FIXES (this version):
 3. Weekly prompt also updated to group same-time events.
 4. Random 💡 signature 25% of the time.
 5. "Be careful" reminder lines — short, event-specific.
+
+CRITICAL BUGS FIXED:
+1. Decimal/Prediction Regex Bug: Decimals in prices ($2.50) no longer break sentences.
+2. 4-Digit Price Eraser: Replaced `\b\d{4}\b` with `\b20\d{2}\b` to protect asset prices.
+3. Unescaped HTML Crash: Added safe HTML escaping for Telethon compatibility.
+4. Groq JSON Format: Added `response_format={"type": "json_object"}` to prevent Llama output crashes.
 """
 
 import asyncio
@@ -60,19 +66,6 @@ _HASHTAG_DXY_KEYWORDS = [
 
 
 def _detect_hashtags(text: str) -> str:
-    """
-    Hard keyword detection — CODE decides hashtags, not AI.
-
-    Rules:
-    - Gold / XAU mentioned        → #XAUUSD
-    - Oil / Crude / Brent / OPEC  → #OIL
-    - Dollar / DXY / Fed / Tariff → #DXY
-    - Multiple markets             → multiple hashtags e.g. #XAUUSD #OIL
-    - No relevant market           → no hashtag (skip)
-    - Calendar posts               → never add hashtags
-
-    Returns hashtag string like "#XAUUSD #OIL" or "" if none apply.
-    """
     if not text:
         return ""
     if "TODAY'S USD" in text or "WEEKLY HIGH IMPACT" in text:
@@ -92,22 +85,13 @@ def _detect_hashtags(text: str) -> str:
 
 
 def _apply_hashtags(text: str) -> str:
-    """
-    Strip ALL existing hashtags from text (AI-generated or otherwise),
-    detect correct ones from content keywords, append them.
-    This is the single source of truth for hashtags — called on every post.
-    """
     if not text:
         return text
 
-    # Calendar posts — strip hashtags, never add any
     if "TODAY'S USD" in text or "WEEKLY HIGH IMPACT" in text:
         return re.sub(r"#\w+", "", text).strip()
 
-    # Detect correct hashtags from FULL text before stripping
     hashtags = _detect_hashtags(text)
-
-    # Strip ALL existing hashtags
     clean = re.sub(r"#\w+", "", text).strip()
 
     if hashtags:
@@ -116,11 +100,6 @@ def _apply_hashtags(text: str) -> str:
 
 
 def _add_signature(text: str) -> str:
-    """
-    Add channel signature as HTML link — more reliable than markdown
-    for clickable links in Telethon channel posts.
-    All send functions must use parse_mode='html'.
-    """
     text = text.strip()
     if "Squad 4xx" not in text:
         if random.random() < 0.25:
@@ -153,16 +132,15 @@ def _add_us_flag_emoji(text: str) -> str:
 
 
 def _strip_be_careful(text: str) -> str:
-    """Remove any AI-generated 'Be careful' line — we add our own controlled version."""
     return re.sub(r'\n?Be careful[^\n]*\n?', '', text, flags=re.IGNORECASE).strip()
 
 
 def _strip_predictions(text: str) -> str:
-    """Hard-strip any AI-added prediction/opinion sentences."""
+    """Hard-strip any AI-added prediction/opinion sentences (safely ignoring decimals)."""
     if not text:
         return text
-    _PREDICT_RE = re.compile(
-        r'[^.!?\n]*\b('
+        
+    _PREDICT_KEYWORDS = (
         r'could\s+(go|rise|fall|drop|reach|push|move|head)|'
         r'may\s+(lead|push|cause|result|trigger|move)|'
         r'might\s+(rise|fall|drop|push|move)|'
@@ -173,15 +151,24 @@ def _strip_predictions(text: str) -> str:
         r'bulls?\s+(could|may|might)|bears?\s+(could|may|might)|'
         r'bullish\s+(momentum|signal|outlook)|'
         r'bearish\s+(momentum|signal|outlook)'
-        r')[^.!?\n]*[.!?\n]?',
-        re.IGNORECASE
     )
-    cleaned = _PREDICT_RE.sub('', text).strip()
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-    return cleaned
+    
+    # Split by actual sentence boundaries (., !, ?, \n) but IGNORE decimals like 2.50
+    sentences = re.split(r'(?<!\d)\.(?!\d)|[!?\n]', text)
+    cleaned_sentences = []
+    
+    for sentence in sentences:
+        if not sentence:
+            continue
+        if re.search(_PREDICT_KEYWORDS, sentence, re.IGNORECASE):
+            continue
+        cleaned_sentences.append(sentence.strip())
+        
+    cleaned = ". ".join(cleaned_sentences) + "."
+    cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
+    return cleaned if cleaned != "." else ""
 
 
-# Filler phrases AI commonly adds that were NOT in the source
 _AI_FILLER_PHRASES = [
     r'\bas investors\b[^.]*',
     r'\bamid\s+(concerns?|fears?|uncertainty|tensions?|pressure)[^,.\n]*',
@@ -210,29 +197,20 @@ _AI_FILLER_RE = re.compile(
 
 
 def _strip_ai_filler(text: str) -> str:
-    """
-    Remove filler phrases AI commonly adds that were NOT in the source.
-    Examples: "as investors fled risk assets", "amid concerns",
-    "in response to", "driven by", "this comes as", etc.
-    """
     if not text:
         return text
     cleaned = _AI_FILLER_RE.sub('', text)
-    # Clean up punctuation left behind
     cleaned = re.sub(r'\s*,\s*,', ',', cleaned)
     cleaned = re.sub(r'\s*\.\s*\.', '.', cleaned)
     cleaned = re.sub(r',\s*\.', '.', cleaned)
-    cleaned = re.sub(r'\s+\.', '.', cleaned)   # "word ." → "word."
-    cleaned = re.sub(r'\s+,', ',', cleaned)    # "word ," → "word,"
+    cleaned = re.sub(r'\s+\.', '.', cleaned)
+    cleaned = re.sub(r'\s+,', ',', cleaned)
     cleaned = re.sub(r'\s{2,}', ' ', cleaned)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
 
 
 def _get_be_careful_line(event_name: str) -> str:
-    """
-    Short, event-specific 'be careful' line for reminders.
-    """
     n = event_name.lower()
     if any(kw in n for kw in ["fomc", "federal funds", "interest rate", "fed chair", "powell", "federal reserve"]):
         return "⚠️ Fed decisions move everything. Be careful — no new trades during the release."
@@ -546,7 +524,6 @@ Be aggressive: if there is any reasonable chance they are the same, mark same_st
 Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-# ── FIXED: AI now groups same-time events on ONE line with comma-separated names
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
@@ -609,7 +586,6 @@ If valid ForexFactory today → {{"approved": true, "reason": "valid FF today im
 RESPOND WITH VALID JSON ONLY.
 """.strip()
 
-# ── FIXED: Weekly prompt also groups same-time events
 _FF_WEEKLY_IMAGE_PROMPT = """
 You are analysing a ForexFactory.com calendar screenshot for the weekly outlook.
 
@@ -681,7 +657,8 @@ def _parse_json(raw: str) -> dict:
     if not raw:
         raise ValueError("Empty response from AI engine.")
     raw = re.sub(r"```+(?:json|JSON)?", "", raw)
-    raw = re.sub(r"```+", "", raw)
+    raw = re.sub(r"
+```+", "", raw)
     raw = raw.strip().strip("`").strip()
     raw = re.sub(r",\s*([}\]])", r"\1", raw)
     try:
@@ -708,21 +685,22 @@ def _validate_and_clean(data: dict) -> dict:
     data.setdefault("affects_markets", [])
 
     if data.get("formatted_text"):
-        data["formatted_text"] = data["formatted_text"].replace("*", "")
-        data["formatted_text"] = re.sub(
-            r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", data["formatted_text"]
-        ).strip()
-        data["formatted_text"] = _strip_be_careful(data["formatted_text"])
-        data["formatted_text"] = _strip_predictions(data["formatted_text"])
-        data["formatted_text"] = _strip_ai_filler(data["formatted_text"])
-        text = data["formatted_text"]
+        raw_txt = data["formatted_text"]
+        
+        # ኤችቲኤምኤል ምልክቶችን በደህንነት መለወጥ (Telethon Crash መከላከያ)
+        if not raw_txt.startswith("TODAY'S USD") and not raw_txt.startswith("WEEKLY HIGH"):
+            raw_txt = _escape_html(raw_txt)
 
-        # ── Hashtag decision — AI affects_markets first, keyword fallback ──
-        # Strip ALL existing hashtags from text first
+        raw_txt = raw_txt.replace("*", "")
+        raw_txt = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", raw_txt).strip()
+        raw_txt = _strip_be_careful(raw_txt)
+        raw_txt = _strip_predictions(raw_txt)
+        raw_txt = _strip_ai_filler(raw_txt)
+        text = raw_txt
+
         clean_text = re.sub(r"#\w+", "", text).strip()
 
         if "TODAY'S USD" in text or "WEEKLY HIGH IMPACT" in text:
-            # Calendar posts — never add hashtags
             data["formatted_text"] = clean_text
         else:
             ai_markets = [m.upper() for m in data.get("affects_markets", [])]
@@ -730,11 +708,9 @@ def _validate_and_clean(data: dict) -> dict:
             ai_markets = [m for m in ai_markets if m in valid_markets]
 
             if ai_markets:
-                # AI told us exactly which markets — use that
                 hashtags = " ".join(f"#{m}" for m in ai_markets)
                 log.debug(f"Hashtags from AI affects_markets: {hashtags}")
             else:
-                # Fallback — keyword detection from text
                 hashtags = _detect_hashtags(text)
                 log.debug(f"Hashtags from keyword fallback: {hashtags or '(none)'}")
 
@@ -763,10 +739,6 @@ def _signal_hit(text: str) -> Optional[str]:
     )
     m = _SIGNAL_RE.search(text)
     return m.group(0).strip() if m else None
-
-
-def _strip_asterisks(text: str) -> str:
-    return text.replace("*", "") if text else text
 
 
 class AIEngine:
@@ -814,6 +786,7 @@ class AIEngine:
             return verdict
         except Exception as exc:
             log.warning(f"Gemini failed ({exc}) — trying Groq …")
+            
         try:
             verdict = await asyncio.wait_for(
                 self._groq_call(prompt, image_data, image_mime), timeout=55
@@ -829,8 +802,8 @@ class AIEngine:
                     verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
             return verdict
         except Exception as exc:
-            log.error(f"Both engines failed — safe reject.")
-            return _reject("Both AI engines unavailable.", "engine_error", confidence=0.0)
+            log.error(f"Both engines failed — safe reject: {exc}")
+            return {"approved": False, "reason": "Both AI engines unavailable.", "issues": ["engine_error"]}
 
     async def is_same_story(self, text_a: str, text_b: str,
                             image_a: Optional[bytes] = None,
@@ -866,6 +839,7 @@ class AIEngine:
             return same and conf >= 0.55
         except Exception as exc:
             log.warning(f"Gemini similarity failed ({exc}) — trying Groq …")
+            
         try:
             content = []
             if image_a:
@@ -873,10 +847,12 @@ class AIEngine:
             if image_b:
                 content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(image_b)}"}})
             content.append({"type": "text", "text": prompt})
+            
             resp = await asyncio.wait_for(
                 self._groq.chat.completions.create(
                     model="meta-llama/llama-4-scout-17b-16e-instruct",
                     messages=[{"role": "user", "content": content}],
+                    response_format={"type": "json_object"},
                     temperature=0.1, max_tokens=300,
                 ),
                 timeout=25,
@@ -910,6 +886,7 @@ class AIEngine:
             return data
         except Exception as exc:
             log.warning(f"Gemini FF failed ({exc}) — trying Groq …")
+            
         try:
             content = [
                 {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}},
@@ -919,6 +896,7 @@ class AIEngine:
                 self._groq.chat.completions.create(
                     model="meta-llama/llama-4-scout-17b-16e-instruct",
                     messages=[{"role": "user", "content": content}],
+                    response_format={"type": "json_object"},
                     temperature=0.1, max_tokens=800,
                 ),
                 timeout=60,
@@ -937,22 +915,8 @@ class AIEngine:
 
     async def analyse_video(self, caption: str,
                             frames: Optional[List[bytes]] = None) -> dict:
-        """
-        Full video analysis — two-stage:
-
-        STAGE 1: Caption only (fast, no image cost).
-            - If caption is clear war/geopolitical → approve immediately.
-            - If caption is clearly off-topic (signal, promo) → reject immediately.
-            - If caption is empty, vague, or ambiguous → go to Stage 2.
-
-        STAGE 2: Visual frame analysis (only if Stage 1 is uncertain).
-            - Send extracted frames + caption to Gemini Vision.
-            - AI looks at actual video frames to confirm war/conflict content.
-            - Approve or reject based on visual evidence + caption together.
-        """
         caption = (caption or "").strip()
 
-        # ── STAGE 1: Caption analysis ──────────────────────────────────────
         log.info(f"🎥 Video Stage 1 — caption analysis | caption={caption[:80]!r}")
 
         if caption:
@@ -963,7 +927,6 @@ class AIEngine:
                 conf = stage1.get("confidence", 0.5)
                 approved = stage1.get("approved", False)
 
-                # High confidence either way → done, no need for frames
                 if conf >= 0.80:
                     log.info(f"Stage 1 high-confidence → approved={approved} conf={conf:.2f} (skipping frames)")
                     if approved and stage1.get("formatted_text"):
@@ -980,15 +943,13 @@ class AIEngine:
         else:
             log.info("No caption — going straight to visual frame analysis")
 
-        # ── STAGE 2: Visual frame analysis ────────────────────────────────
         if not frames:
             log.info("No frames available for Stage 2 — rejecting (no caption + no frames)")
-            return _reject("No caption and no frames to analyse.", "no_content", confidence=1.0)
+            return {"approved": False, "reason": "No caption and no frames to analyse.", "issues": ["no_content"], "confidence": 1.0, "engine": "pre_filter"}
 
         log.info(f"🎥 Video Stage 2 — visual analysis | frames={len(frames)}")
         prompt = _VIDEO_VISUAL_PROMPT.format(caption=caption or "(no caption)")
 
-        # Build parts: up to 4 frames + prompt
         parts = []
         for frame_bytes in frames[:4]:
             parts.append({
@@ -999,7 +960,6 @@ class AIEngine:
             })
         parts.append(prompt)
 
-        # Try Gemini Vision
         try:
             loop = asyncio.get_event_loop()
             resp = await asyncio.wait_for(
@@ -1023,7 +983,6 @@ class AIEngine:
         except Exception as exc:
             log.warning(f"Stage 2 Gemini Vision failed ({exc}) — trying Groq …")
 
-        # Fallback: Groq with frames as image_url
         try:
             content = []
             for frame_bytes in frames[:4]:
@@ -1032,10 +991,12 @@ class AIEngine:
                     "image_url": {"url": f"data:image/jpeg;base64,{_b64(frame_bytes)}"}
                 })
             content.append({"type": "text", "text": prompt})
+            
             resp = await asyncio.wait_for(
                 self._groq.chat.completions.create(
                     model="meta-llama/llama-4-scout-17b-16e-instruct",
                     messages=[{"role": "user", "content": content}],
+                    response_format={"type": "json_object"},
                     temperature=0.1, max_tokens=600,
                 ),
                 timeout=60,
@@ -1052,12 +1013,11 @@ class AIEngine:
             return data
         except Exception as exc:
             log.error(f"Stage 2 both engines failed: {exc}")
-            return _reject("AI engines unavailable for video analysis.", "engine_error", confidence=0.0)
+            return {"approved": False, "reason": "AI engines unavailable for video analysis.", "engine": "engine_error", "confidence": 0.0}
 
     async def _try_engines_text(self, prompt: str,
                                 timeout_gemini: int = 30,
                                 timeout_groq: int = 40) -> Optional[dict]:
-        """Try Gemini then Groq for a text-only prompt. Returns None if both fail."""
         try:
             result = await asyncio.wait_for(
                 self._gemini_call(prompt, None, "image/jpeg"), timeout=timeout_gemini
@@ -1066,6 +1026,7 @@ class AIEngine:
             return result
         except Exception as exc:
             log.warning(f"_try_engines_text Gemini failed: {exc}")
+            
         try:
             result = await asyncio.wait_for(
                 self._groq_call(prompt, None, "image/jpeg"), timeout=timeout_groq
@@ -1111,10 +1072,12 @@ class AIEngine:
             content.append({"type": "image_url",
                             "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}})
         content.append({"type": "text", "text": prompt})
+        
         resp = await self._groq.chat.completions.create(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=[{"role": "system", "content": _SYSTEM_PROMPT},
                       {"role": "user", "content": content}],
+            response_format={"type": "json_object"},
             temperature=0.15, max_tokens=600,
         )
         return _parse_json(resp.choices[0].message.content)
@@ -1146,50 +1109,38 @@ class AIEngine:
         return _add_signature(text)
 
 
-def _reject(reason: str, issue: str, confidence: float = 1.0) -> dict:
-    return {
-        "approved": False,
-        "reason": reason,
-        "issues": [issue],
-        "formatted_text": "",
-        "confidence": confidence,
-        "engine": "pre_filter",
-    }
-
-
 def _build_post_body(text: str, ai_markets: list = None) -> str:
     """
     Build final post body.
     ai_markets: list from AI affects_markets e.g. ["XAUUSD", "OIL"]
-    AI markets used first — keyword detection as fallback only.
     """
     if not text:
         return ""
+        
     text = text.replace("*", "")
     text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text).strip()
     text = _strip_be_careful(text)
     text = _strip_predictions(text)
     text = _strip_ai_filler(text)
+    
     lines = text.split('\n')
     for i in range(max(0, len(lines) - 3), len(lines)):
-        lines[i] = re.sub(r'\b\d{4}\b', '', lines[i])
+        # አመተምህረቶችን ብቻ (20xx) ይሰርዛል እንጂ የዋጋ መጠንን አያጠፋም
+        lines[i] = re.sub(r'\b20\d{2}\b', '', lines[i])
+        
     text = '\n'.join(lines)
     text = re.sub(r'\n\s*\n', '\n\n', text).strip()
 
-    # ── Hashtag: AI markets first, keyword fallback ────────────────────────
     if "TODAY'S USD" in text or "WEEKLY HIGH IMPACT" in text:
-        # Calendar posts — never add hashtags
         text = re.sub(r"#\w+", "", text).strip()
     else:
         valid = {"XAUUSD", "OIL", "DXY"}
         clean_markets = [m.upper() for m in (ai_markets or []) if m.upper() in valid]
         clean_text = re.sub(r"#\w+", "", text).strip()
         if clean_markets:
-            # AI explicitly told us which markets
             hashtags = " ".join(f"#{m}" for m in clean_markets)
             log.debug(f"Hashtags from AI: {hashtags}")
         else:
-            # Fallback — keyword scan of text
             hashtags = _detect_hashtags(text)
             log.debug(f"Hashtags from keyword fallback: {hashtags or '(none)'}")
         text = clean_text + ("\n\n" + hashtags if hashtags else "")
