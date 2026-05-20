@@ -8,12 +8,11 @@ What this bot does:
   • Double duplicate protection: hash + AI similarity
   • ForexFactory calendar image posted manually → bot posts daily briefing (max 1/day)
   • Weekly FF image posted Sunday → weekly high impact news post
-  • 15-min reminders for VIP USD events (FOMC, NFP, CPI, GDP, PCE, Powell)
+  • 10-min reminders for USD/Gold/FOMC red events (max 2/day)
   • Every post ends with [Squad 4xx](https://t.me/Squad_4xx)
   • Posts to ALL destination channels simultaneously
   • No forecast, no previous, no NOTE line anywhere
   • Times: 12-hour AM/PM EAT (GMT+3)
-  • /stop /start /status commands via Saved Messages
 
 Environment variables:
   Required:
@@ -26,7 +25,6 @@ Environment variables:
     GROQ_API_KEY          — Groq key (fallback)
 
   Optional:
-    OWNER_ID              — your Telegram user ID (for /stop /start /status)
     DEST_CHANNEL          — legacy single-channel fallback
     TELEGRAM_PHONE        — phone if not using StringSession
     SESSION_NAME          — file session name (default: manager_session)
@@ -37,7 +35,6 @@ Environment variables:
     LOOKBACK_HOURS        — how far back on first run (default: 2)
     DB_PATH               — SQLite path (default: memory.db)
     HASH_TTL_DAYS         — days to keep hashes (default: 30)
-    SUPABASE_DB           — Supabase PostgreSQL connection string
 """
 
 import asyncio
@@ -45,9 +42,7 @@ import logging
 import os
 import signal
 import sys
-from datetime import datetime
 
-import pytz
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -66,8 +61,6 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("main")
-
-EAT = pytz.timezone("Africa/Addis_Ababa")
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -139,13 +132,9 @@ CONFIG = {
     "hash_ttl_days":         int(os.getenv("HASH_TTL_DAYS", "30")),
 }
 
-# Owner Telegram user ID — for /stop /start /status via saved messages
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-
 
 # ─── Graceful shutdown ─────────────────────────────────────────────────────────
 _shutdown = asyncio.Event()
-_bot_running = True   # controls whether poll/reminder loops are active
 
 
 def _handle_signal(sig, _frame):
@@ -157,87 +146,15 @@ signal.signal(signal.SIGINT,  _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 
-# ─── Command listener — saved messages ────────────────────────────────────────
-async def command_listener(scraper: ChannelScraper, memory: MemoryManager):
-    global _bot_running
-
-    if not OWNER_ID:
-        log.info("ℹ️  OWNER_ID not set — /stop /start /status disabled")
-        return
-
-    log.info(f"🎮  Command listener active (owner_id={OWNER_ID})")
-    last_id = 0
-    started_at = datetime.now(EAT)
-
-    while not _shutdown.is_set():
-        try:
-            async for msg in scraper._client.iter_messages("me", limit=5):
-                if msg.id <= last_id:
-                    continue
-                last_id = max(last_id, msg.id)
-                text = (msg.text or "").strip().lower()
-                if not text.startswith("/"):
-                    continue
-
-                log.info(f"📨  Command received: {text!r}")
-
-                if text == "/stop":
-                    _bot_running = False
-                    await scraper._client.send_message(
-                        "me", "⏸️ Bot stopped.\nSend /start to resume."
-                    )
-
-                elif text == "/start":
-                    _bot_running = True
-                    await scraper._client.send_message(
-                        "me", "▶️ Bot started.\nScraping resumed."
-                    )
-
-                elif text == "/status":
-                    stats = await memory.stats()
-                    uptime = datetime.now(EAT) - started_at
-                    h, rem = divmod(int(uptime.total_seconds()), 3600)
-                    m = rem // 60
-                    state = "▶️ Running" if _bot_running else "⏸️ Stopped"
-                    db_mode = stats.get("db_mode", "sqlite")
-                    status = (
-                        f"📊 AXIOM INTEL STATUS\n\n"
-                        f"State: {state}\n"
-                        f"Uptime: {h}h {m}m\n"
-                        f"Hashes tracked: {stats['tracked_hashes']}\n"
-                        f"Posts (24h): {stats['posted_last_24h']}\n"
-                        f"Database: {db_mode}\n"
-                        f"Time (EAT): {datetime.now(EAT).strftime('%H:%M:%S')}"
-                    )
-                    await scraper._client.send_message("me", status)
-
-                else:
-                    await scraper._client.send_message(
-                        "me",
-                        "❓ Unknown command.\n\nAvailable:\n/start\n/stop\n/status"
-                    )
-
-        except Exception as exc:
-            log.warning(f"Command listener error: {exc}")
-
-        try:
-            await asyncio.wait_for(_shutdown.wait(), timeout=15)
-        except asyncio.TimeoutError:
-            pass
-
-
 # ─── Poll loop ─────────────────────────────────────────────────────────────────
 async def poll_loop(scraper: ChannelScraper):
     log.info("✅  Poll loop started.")
     interval = CONFIG["poll_interval_seconds"]
     while not _shutdown.is_set():
-        if _bot_running:
-            try:
-                await scraper.poll_and_forward()
-            except Exception as exc:
-                log.error(f"Poll cycle error: {exc}", exc_info=True)
-        else:
-            log.debug("Bot paused — skipping poll")
+        try:
+            await scraper.poll_and_forward()
+        except Exception as exc:
+            log.error(f"Poll cycle error: {exc}", exc_info=True)
         try:
             await asyncio.wait_for(_shutdown.wait(), timeout=interval)
         except asyncio.TimeoutError:
@@ -248,11 +165,10 @@ async def poll_loop(scraper: ChannelScraper):
 async def reminder_loop(scraper: ChannelScraper):
     log.info("🔔  Reminder loop started.")
     while not _shutdown.is_set():
-        if _bot_running:
-            try:
-                await scraper._check_reminders()
-            except Exception as exc:
-                log.error(f"Reminder loop error: {exc}", exc_info=True)
+        try:
+            await scraper._check_reminders()
+        except Exception as exc:
+            log.error(f"Reminder loop error: {exc}", exc_info=True)
         try:
             await asyncio.wait_for(_shutdown.wait(), timeout=60)
         except asyncio.TimeoutError:
@@ -287,10 +203,10 @@ async def run():
     await scraper.start()
 
     try:
+        # Always run both loops — reminder loop checks every 60s
         await asyncio.gather(
             poll_loop(scraper),
             reminder_loop(scraper),
-            command_listener(scraper, memory),
         )
     finally:
         log.info("🛑  Shutting down …")
