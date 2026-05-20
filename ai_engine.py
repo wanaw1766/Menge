@@ -66,6 +66,19 @@ _HASHTAG_DXY_KEYWORDS = [
 
 
 def _detect_hashtags(text: str) -> str:
+    """
+    Hard keyword detection — CODE decides hashtags, not AI.
+
+    Rules:
+    - Gold / XAU mentioned        → #XAUUSD
+    - Oil / Crude / Brent / OPEC  → #OIL
+    - Dollar / DXY / Fed / Tariff → #DXY
+    - Multiple markets             → multiple hashtags e.g. #XAUUSD #OIL
+    - No relevant market           → no hashtag (skip)
+    - Calendar posts               → never add hashtags
+
+    Returns hashtag string like "#XAUUSD #OIL" or "" if none apply.
+    """
     if not text:
         return ""
     if "TODAY'S USD" in text or "WEEKLY HIGH IMPACT" in text:
@@ -85,13 +98,22 @@ def _detect_hashtags(text: str) -> str:
 
 
 def _apply_hashtags(text: str) -> str:
+    """
+    Strip ALL existing hashtags from text (AI-generated or otherwise),
+    detect correct ones from content keywords, append them.
+    This is the single source of truth for hashtags — called on every post.
+    """
     if not text:
         return text
 
+    # Calendar posts — strip hashtags, never add any
     if "TODAY'S USD" in text or "WEEKLY HIGH IMPACT" in text:
         return re.sub(r"#\w+", "", text).strip()
 
+    # Detect correct hashtags from FULL text before stripping
     hashtags = _detect_hashtags(text)
+
+    # Strip ALL existing hashtags
     clean = re.sub(r"#\w+", "", text).strip()
 
     if hashtags:
@@ -100,6 +122,11 @@ def _apply_hashtags(text: str) -> str:
 
 
 def _add_signature(text: str) -> str:
+    """
+    Add channel signature as HTML link — more reliable than markdown
+    for clickable links in Telethon channel posts.
+    All send functions must use parse_mode='html'.
+    """
     text = text.strip()
     if "Squad 4xx" not in text:
         if random.random() < 0.25:
@@ -132,6 +159,7 @@ def _add_us_flag_emoji(text: str) -> str:
 
 
 def _strip_be_careful(text: str) -> str:
+    """Remove any AI-generated 'Be careful' line — we add our own controlled version."""
     return re.sub(r'\n?Be careful[^\n]*\n?', '', text, flags=re.IGNORECASE).strip()
 
 
@@ -169,6 +197,7 @@ def _strip_predictions(text: str) -> str:
     return cleaned if cleaned != "." else ""
 
 
+# Filler phrases AI commonly adds that were NOT in the source
 _AI_FILLER_PHRASES = [
     r'\bas investors\b[^.]*',
     r'\bamid\s+(concerns?|fears?|uncertainty|tensions?|pressure)[^,.\n]*',
@@ -197,20 +226,29 @@ _AI_FILLER_RE = re.compile(
 
 
 def _strip_ai_filler(text: str) -> str:
+    """
+    Remove filler phrases AI commonly adds that were NOT in the source.
+    Examples: "as investors fled risk assets", "amid concerns",
+    "in response to", "driven by", "this comes as", etc.
+    """
     if not text:
         return text
     cleaned = _AI_FILLER_RE.sub('', text)
+    # Clean up punctuation left behind
     cleaned = re.sub(r'\s*,\s*,', ',', cleaned)
     cleaned = re.sub(r'\s*\.\s*\.', '.', cleaned)
     cleaned = re.sub(r',\s*\.', '.', cleaned)
-    cleaned = re.sub(r'\s+\.', '.', cleaned)
-    cleaned = re.sub(r'\s+,', ',', cleaned)
+    cleaned = re.sub(r'\s+\.', '.', cleaned)   # "word ." → "word."
+    cleaned = re.sub(r'\s+,', ',', cleaned)    # "word ," → "word,"
     cleaned = re.sub(r'\s{2,}', ' ', cleaned)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
 
 
 def _get_be_careful_line(event_name: str) -> str:
+    """
+    Short, event-specific 'be careful' line for reminders.
+    """
     n = event_name.lower()
     if any(kw in n for kw in ["fomc", "federal funds", "interest rate", "fed chair", "powell", "federal reserve"]):
         return "⚠️ Fed decisions move everything. Be careful — no new trades during the release."
